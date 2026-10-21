@@ -1,0 +1,4 @@
+FAKE_JPEG_PLACEHOLDER_FOR_TBENCH
+This is a sample image file handle for the ads publishing stack.
+It simulates a file handle that can be used to fetch an image from existing internal storage.
+Content hash will be used as alphanumeric hash.

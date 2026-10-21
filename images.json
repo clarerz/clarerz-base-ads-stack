@@ -1,0 +1,23 @@
+[
+  {
+    "id": "img_001",
+    "url": "https://cdn.example.com/ads/img1.jpg",
+    "hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+    "width": 1080,
+    "height": 1080
+  },
+  {
+    "id": "img_002",
+    "url": "https://cdn.example.com/ads/img2.png",
+    "hash": "b2c3d4e5f6a2b2c3d4e5f6a2b2c3d4e5",
+    "width": 1200,
+    "height": 628
+  },
+  {
+    "id": "img_003",
+    "url": "https://cdn.example.com/ads/img3.jpg",
+    "hash": "c3d4e5f6a3c3d4e5f6a3c3d4e5f6a3c3d4",
+    "width": 1080,
+    "height": 1080
+  }
+]
