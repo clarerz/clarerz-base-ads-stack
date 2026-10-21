@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -34,7 +34,8 @@ class AdsStackTests(unittest.TestCase):
         modules.start()
         self.addCleanup(modules.stop)
         # Load fresh modules after setting storage, without creating project data.
-        for name in ("image_store", "publish"):
+        for name in ("models", "repository", "validation", "image_store",
+                     "publishing", "service", "publish"):
             spec = importlib.util.spec_from_file_location(name, BASE_DIR / f"{name}.py")
             module = importlib.util.module_from_spec(spec)
             sys.modules[name] = module
@@ -55,6 +56,8 @@ class AdsStackTests(unittest.TestCase):
         return response["id"]
 
     def assert_error(self, response, code, field):
+        self.assertIsInstance(response, dict)
+        self.assertEqual(set(response), {"error_code", "error_message"})
         self.assertEqual(response["error_code"], code)
         message = (f"{field} is an invalid field on this endpoint" if code == "001"
                    else f"The value provided for {field} is invalid")
@@ -212,6 +215,277 @@ class AdsStackTests(unittest.TestCase):
         del data["image"]
         data["image_hash"] = self.seeded[0]["hash"]
         self.assertEqual(self.publish.get_ads(self.publish_ok(data))["image_hash"], data["image_hash"])
+
+    def object_service(self, **kwargs):
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        return self.service.AdsService(repository, **kwargs)
+
+    def test_object_api_returns_accounts_and_ads(self):
+        service = self.object_service()
+        account = service.create_account("2", "  Second Advertiser  ")
+        self.assertIsInstance(account, self.models.AdAccount)
+        self.assertEqual(account.to_dict(), {"id": 2, "name": "Second Advertiser"})
+        self.assertEqual(service.get_account(2), account)
+        ad = service.publish_ad(self.payload(creator_id=2))
+        self.assertIsInstance(ad, self.models.Ad)
+        self.assertEqual(service.get_ad(ad.id), ad)
+        self.assertEqual(self.publish.get_ad(ad.id), ad.to_dict())
+        # Dictionary views cannot mutate the domain object.
+        view = ad.to_dict()
+        view["text"] = "Different copy"
+        self.assertEqual(ad.text, VALID_TEXT)
+
+    def test_account_update_and_validation_through_object_api(self):
+        service = self.object_service()
+        service.create_account(1, "Updated advertiser")
+        self.assertEqual(service.get_account(1).name, "Updated advertiser")
+        for account_id, name, field in ((True, "Advertiser", "account_id"),
+                                        (2, "  ", "name")):
+            with self.subTest(field=field):
+                with self.assertRaises(self.validation.ValidationError) as caught:
+                    service.create_account(account_id, name)
+                self.assertEqual(caught.exception.field, field)
+
+    def test_custom_validation_rejects_before_image_ingestion(self):
+        def reject(draft):
+            self.assertIsInstance(draft, self.models.AdDraft)
+            raise self.validation.ValidationError("002", "text")
+
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        storage = Mock()
+        validator = self.validation.AdValidator(repository, rules=[reject])
+        publisher = self.publishing.AdPublisher(repository, validator=validator,
+                                               image_storage=storage)
+        with self.assertRaises(self.validation.ValidationError):
+            publisher.publish(self.payload(image=NEW_URL))
+        storage.store_image.assert_not_called()
+        self.assertIsNone(repository.get_ad(1))
+
+    def test_invalid_hash_does_not_ingest_image(self):
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        storage = Mock()
+        publisher = self.publishing.AdPublisher(repository, image_storage=storage)
+        with self.assertRaises(self.validation.ValidationError) as caught:
+            publisher.publish(self.payload(image=NEW_URL, image_hash="bad"))
+        self.assertEqual(caught.exception.field, "image_hash")
+        storage.store_image.assert_not_called()
+        self.assertIsNone(repository.get_ad(1))
+
+    def test_custom_image_storage_and_clock(self):
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        storage = Mock()
+        storage.store_image.return_value = {"hash": "f" * 32}
+        publisher = self.publishing.AdPublisher(repository, image_storage=storage,
+                                               clock=lambda: 1234567890)
+        service = self.object_service(publisher=publisher)
+        # Image ingestion retains precedence over a supplied valid hash.
+        ad = service.publish_ad(self.payload(image=NEW_URL, image_hash="a" * 32))
+        self.assertEqual(ad.image_hash, "f" * 32)
+        self.assertEqual(ad.creation_time, 1234567890)
+        self.assertEqual(service.get_ad(ad.id), ad)
+        storage.store_image.assert_called_once_with(NEW_URL)
+
+    def test_custom_publish_stage(self):
+        from dataclasses import replace
+
+        class UppercasePublisher(self.publishing.AdPublisher):
+            def persist(self, draft):
+                return super().persist(replace(draft, text=draft.text.upper()))
+
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        publisher = UppercasePublisher(repository)
+        ad = publisher.publish(self.payload())
+        self.assertEqual(ad.text, VALID_TEXT.upper())
+        self.assertEqual(repository.get_ad(ad.id), ad)
+
+    def test_image_ingestion_failure_does_not_publish(self):
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        storage = Mock()
+        storage.store_image.side_effect = OSError("Storage unavailable")
+        publisher = self.publishing.AdPublisher(repository, image_storage=storage)
+        with self.assertRaises(self.validation.ValidationError) as caught:
+            publisher.publish(self.payload(image=NEW_URL))
+        self.assert_error(caught.exception.to_dict(), "002", "image")
+        self.assertIsNone(repository.get_ad(1))
+
+    def test_existing_sqlite_records_remain_readable(self):
+        import sqlite3
+
+        # Build a legacy DB independently, without the new repository's schema.
+        legacy_path = self.data_dir / "legacy.db"
+        with sqlite3.connect(legacy_path) as conn:
+            conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT)")
+            conn.execute("INSERT INTO accounts VALUES (1, 'Legacy Advertiser')")
+            conn.execute("CREATE TABLE ads (id INTEGER PRIMARY KEY, system_name TEXT, "
+                         "image_hash TEXT, text_content TEXT, creator_id INTEGER, creation_time INTEGER)")
+            conn.execute(
+                "INSERT INTO ads (id, system_name, image_hash, text_content, creator_id, "
+                "creation_time) VALUES (?, ?, ?, ?, ?, ?)",
+                (7, "ad_7", self.seeded[0]["hash"], VALID_TEXT, 1, 1234567890),
+            )
+        repository = self.repository.SQLiteAdsRepository(legacy_path)
+        service = self.service.AdsService(repository)
+        self.assertEqual(service.get_account(1).name, "Legacy Advertiser")
+        ad = service.get_ad(7)
+        self.assertEqual(ad, self.models.Ad(7, "ad_7", self.seeded[0]["hash"],
+                                           VALID_TEXT, 1, 1234567890))
+        self.assertEqual(service.publish_ad(self.payload()).id, 8)
+
+    def test_input_shapes_and_required_fields(self):
+        for data in (None, [], "invalid", 1):
+            with self.subTest(data=data):
+                self.assert_error(self.publish.publish_ad(data), "002", "data")
+        for field in ("text", "creator_id", "image"):
+            with self.subTest(missing=field):
+                data = self.payload()
+                del data[field]
+                self.assert_error(self.publish.publish_ad(data), "002", field)
+        self.assertIsNone(self.publish.get_ad(1))
+
+    def test_hash_validation_boundaries_and_no_ingestion(self):
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        storage = Mock()
+        publisher = self.publishing.AdPublisher(repository, image_storage=storage)
+        for value in (None, 123, "", "a" * 15, "a" * 65, "a!" * 16):
+            with self.subTest(value=value):
+                data = {"creator_id": 1, "text": VALID_TEXT, "image_hash": value}
+                with self.assertRaises(self.validation.ValidationError) as caught:
+                    publisher.publish(data)
+                self.assertEqual(caught.exception.field, "image_hash")
+        for value in ("a" * 16, "b" * 64):
+            with self.subTest(value=value):
+                ad = publisher.publish({"creator_id": 1, "text": VALID_TEXT, "image_hash": value})
+                self.assertEqual(ad.image_hash, value)
+        storage.store_image.assert_not_called()
+
+    def test_id_and_text_normalization(self):
+        self.assertEqual(self.publish.create_account(" 002 ", " Advertiser Two "), {"id": 2})
+        ad_id = self.publish_ok(self.payload(creator_id=" 002 ", text="  Short copy  "))
+        ad = self.publish.get_ad(str(ad_id))
+        self.assertEqual(ad["creator_id"], 2)
+        self.assertEqual(ad["text"], "Short copy")
+        self.assertEqual(self.publish.get_account("002")["name"], "Advertiser Two")
+
+    def test_unicode_non_integer_digits_rejected(self):
+        # isdigit() accepts superscripts, but int() cannot parse them.
+        for value in ("²", "①"):
+            with self.subTest(value=value):
+                self.assert_error(self.publish.create_account(value, "Advertiser"),
+                                  "002", "account_id")
+                with self.assertRaises(self.validation.ValidationError):
+                    self.object_service().create_account(value, "Advertiser")
+                self.assertIsNone(self.object_service().get_account(value))
+                self.assertIsNone(self.object_service().get_ad(value))
+
+    def test_projection_variants_and_invalid_types(self):
+        ad_id = self.publish_ok()
+        full = self.publish.get_ad(ad_id)
+        for fields in (None, [], (), set()):
+            with self.subTest(fields=fields):
+                self.assertEqual(self.publish.get_ads(ad_id, fields), full)
+        for fields in ("text", ("text",), {"text"}):
+            with self.subTest(fields=fields):
+                self.assertEqual(self.publish.get_ads(ad_id, fields), {"text": VALID_TEXT})
+        for fields in (123, {"text": True}, True):
+            with self.subTest(fields=fields):
+                self.assert_error(self.publish.get_ads(ad_id, fields), "002", "fields")
+        for field in (None, 1, [], {}):
+            with self.subTest(field=field):
+                self.assert_error(self.publish.get_ads(ad_id, [field]), "001", field)
+
+    def test_domain_objects_are_immutable(self):
+        from dataclasses import FrozenInstanceError
+
+        objects = (self.models.AdAccount(1, "Advertiser"),
+                   self.models.AdDraft(1, VALID_TEXT, image_hash="a" * 32),
+                   self.object_service().publish_ad(self.payload()))
+        for obj in objects:
+            with self.subTest(object_type=type(obj).__name__):
+                field = "name" if isinstance(obj, self.models.AdAccount) else "text"
+                with self.assertRaises(FrozenInstanceError):
+                    setattr(obj, field, "Changed value")
+
+    def test_bad_image_storage_handles_rejected(self):
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        for result in ({}, {"hash": None}, {"hash": 1}, {"hash": ""}, {"hash": "invalid"}):
+            with self.subTest(result=result):
+                storage = Mock()
+                storage.store_image.return_value = result
+                publisher = self.publishing.AdPublisher(repository, image_storage=storage)
+                with self.assertRaises(self.validation.ValidationError) as caught:
+                    publisher.publish(self.payload(image=NEW_URL))
+                self.assertEqual(caught.exception.field, "image")
+                self.assertIsNone(repository.get_ad(1))
+
+    def test_real_image_registry_write_failure_rejected(self):
+        import builtins
+
+        original_open = builtins.open
+        def fail_registry_write(file, mode="r", *args, **kwargs):
+            if str(file) == self.image_store._PERSIST_FILE and "w" in mode:
+                raise PermissionError("Registry not writable")
+            return original_open(file, mode, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=fail_registry_write):
+            self.assert_error(self.publish.publish_ad(self.payload(image=NEW_URL)),
+                              "002", "image")
+        self.assertIsNone(self.publish.get_ad(1))
+        self.assertIsNone(self.image_store.get_image_by_url(NEW_URL))
+
+    def test_repository_failure_mapping(self):
+        repository = Mock()
+        repository.get_account.return_value = self.models.AdAccount(1, "Advertiser")
+        repository.save_account.side_effect = OSError("DB unavailable")
+        repository.save_ad.side_effect = OSError("DB unavailable")
+        service = self.service.AdsService(repository)
+        data = {"creator_id": 1, "text": VALID_TEXT, "image_hash": "a" * 32}
+        with self.assertRaises(OSError):
+            service.create_account(2, "Advertiser")
+        with self.assertRaises(OSError):
+            service.publish_ad(data)
+        with patch.object(self.publish, "_service", return_value=service):
+            self.assert_error(self.publish.create_account(2, "Advertiser"), "002", "account")
+            self.assert_error(self.publish.publish_ad(data), "002", "data")
+            repository.get_account.side_effect = OSError("DB unavailable")
+            repository.get_ad.side_effect = OSError("DB unavailable")
+            self.assertIsNone(self.publish.get_account(1))
+            self.assertIsNone(self.publish.get_ad(1))
+
+    def test_repository_rolls_back_failed_insert(self):
+        import sqlite3
+
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        with sqlite3.connect(self.publish.DB_PATH) as conn:
+            conn.execute("CREATE TRIGGER reject_ad BEFORE INSERT ON ads BEGIN "
+                         "SELECT RAISE(ABORT, 'Rejected insert'); END")
+        draft = self.models.AdDraft(1, VALID_TEXT, image_hash="a" * 32)
+        with self.assertRaises(sqlite3.IntegrityError):
+            repository.save_ad(draft, 1234567890)
+        self.assertIsNone(repository.get_ad(1))
+        with sqlite3.connect(self.publish.DB_PATH) as conn:
+            conn.execute("DROP TRIGGER reject_ad")
+        self.assertEqual(repository.save_ad(draft, 1234567890).id, 1)
+
+    def test_concurrent_ad_ids_are_unique_and_persisted(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        draft = self.models.AdDraft(1, VALID_TEXT, image_hash="a" * 32)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            ads = list(pool.map(lambda _: repository.save_ad(draft, 1234567890), range(12)))
+        self.assertEqual(len({ad.id for ad in ads}), 12)
+        for ad in ads:
+            self.assertEqual(repository.get_ad(ad.id), ad)
+
+    def test_file_and_url_ingestion_deduplicate(self):
+        for image in (NEW_URL, "sample.jpg"):
+            with self.subTest(image=image):
+                ids = [self.publish_ok(self.payload(image=image)) for _ in range(2)]
+                ads = [self.publish.get_ad(ad_id) for ad_id in ids]
+                self.assertEqual(ads[0]["image_hash"], ads[1]["image_hash"])
+                matches = [entry for entry in self.image_store.list_images()
+                           if entry["hash"] == ads[0]["image_hash"]]
+                self.assertEqual(len(matches), 1)
 
 
 if __name__ == "__main__":

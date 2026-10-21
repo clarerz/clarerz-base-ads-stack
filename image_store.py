@@ -43,12 +43,9 @@ def _load_persisted() -> List[Dict]:
 
 
 def _save_persisted(images: List[Dict]) -> None:
-    try:
-        with open(_PERSIST_FILE, "w") as f:
-            json.dump(images, f, indent=2)
-    except Exception:
-        # Best-effort – ignore transient failures here; caller maps to 002
-        pass
+    # Propagate failures so publishing cannot report a non-durable image as saved.
+    with open(_PERSIST_FILE, "w") as f:
+        json.dump(images, f, indent=2)
 
 
 def _hash_for_url(url: str) -> str:

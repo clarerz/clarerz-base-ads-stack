@@ -43,6 +43,74 @@ not look like a URL or a hash.
 the existing implementation does not check that the handle exists. If both image
 fields are supplied, the ingested image's hash takes precedence.
 
+## Objects and code structure
+
+`AdAccount` and `Ad` are immutable dataclasses with named fields and `to_dict()`
+methods. `AdDraft` represents validated input before publication assigns an ID
+and metadata. The existing functions in `publish.py` still return dictionaries.
+
+| Module | Responsibility |
+| --- | --- |
+| `models.py` | `AdAccount`, `AdDraft`, and `Ad` objects. |
+| `repository.py` | `AdsRepository` storage interface and SQLite implementation. |
+| `validation.py` | Account, ad input, and read projection validation. |
+| `publishing.py` | `AdPublisher`: validate input, normalize the image, persist the ad. |
+| `service.py` | `AdsService` object API for accounts and ads. |
+| `publish.py` | Compatibility API that translates objects and errors into dictionaries. |
+
+Use the object API to work directly with accounts and ads:
+
+```python
+import publish
+from repository import SQLiteAdsRepository
+from service import AdsService
+
+repository = SQLiteAdsRepository(publish.DB_PATH)
+service = AdsService(repository)
+account = service.create_account(1, "Example advertiser")
+ad = service.publish_ad({
+    "creator_id": account.id,
+    "text": "Discover our new collection",
+    "image": "sample.jpg",
+})
+print(ad.id, ad.text, ad.image_hash)
+print(service.get_ad(ad.id).to_dict())
+```
+
+The object API raises `ValidationError` for invalid input and propagates storage
+failures. The compatibility functions preserve their error dictionaries and
+missing-record behavior. The SQLite schema is unchanged, so existing data works
+with either API.
+
+## Extending validation and publishing
+
+Add validation rules that receive an `AdDraft` and raise `ValidationError` to
+reject it. All validation runs before image ingestion or ad persistence:
+
+```python
+from publishing import AdPublisher
+from validation import AdValidator, ValidationError
+
+def limit_text_length(draft):
+    if len(draft.text) > 120:
+        raise ValidationError("002", "text")
+
+validator = AdValidator(repository, rules=[limit_text_length])
+publisher = AdPublisher(repository, validator=validator)
+service = AdsService(repository, publisher=publisher)
+```
+
+For different field policies, subclass `AdValidator` and override its
+`validate_creator`, `validate_text`, `validate_image`, or `validate_hash` methods,
+or supply a validator with a `validate(data) -> AdDraft` method. Account and
+projection validators are separate classes as well.
+
+`AdPublisher` accepts an `image_storage` object with `store_image(input)` and a
+`clock` callable. Subclass it to customize `normalize_image(draft)` or
+`persist(draft)`, or supply another publisher with `publish(data) -> Ad` to
+`AdsService`. A different repository can implement `save_account`, `get_account`,
+`save_ad`, and `get_ad` using the same domain objects.
+
 ## Storage
 
 By default, generated data lives beside the modules under `data/`:
@@ -79,6 +147,11 @@ python3 -m unittest discover -s tests -v
 The tests use temporary storage and include fresh-process persistence checks.
 They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
+Additional checks cover the object API, custom rules, custom publishing stages,
+injected image storage and clocks, and compatibility with existing SQLite data.
+The suite has 44 tests, including boundary cases, storage failures, rollback, and
+concurrent SQLite ad ID allocation. See [VERIFICATION.md](VERIFICATION.md) for
+the test audit, deliberate regression checks, bugs fixed, and remaining limits.
 
 ## Source
 
