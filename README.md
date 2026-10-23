@@ -28,12 +28,16 @@ PY
 | --- | --- |
 | `create_account(account_id, name)` | Persist an account; an existing ID replaces its name. Returns `{"id": ...}` or an error. |
 | `get_account(account_id)` | Return `id` and `name`, or `None` if missing/invalid. |
-| `publish_ad(data)` | Require an existing `creator_id`, one `text` field, and `image` or `image_hash`. Return a numeric ad ID or an error. |
+| `publish_ad(data)` | Require an existing `creator_id`, one `text` field, and either `image`/`image_hash` (image ad) or `video_id` (video ad). Return a numeric ad ID or an error. |
 | `get_ads(ad_id, fields=None)` | Return the stored ad or requested fields; unknown fields return an error. |
 | `get_ad(ad_id)` | Return the full stored ad, or `None` if missing/invalid. |
+| `upload_video(data)` | Require an existing `owner_id`, a nonblank `name`, and a local video `file` path. Return a numeric video ID or an error. |
+| `rename_video(video_id, name)` | Change a video's name. Return `{"id": ...}`, or an error for a missing video or blank name. |
+| `list_videos(owner_id, limit=None, cursor=None, since=None, until=None)` | Return one page of the account's videos, newest first: `{"data": [...], "next_cursor": ...}`. |
 
 An ad contains `id`, `system_name` (`ad_<id>`), `image_hash`, `text`, `creator_id`,
-and `creation_time` (Unix seconds). Errors contain `error_code` and
+`creation_time` (Unix seconds), and `video_id`. Image ads have `video_id: None`;
+video ads have `image_hash: None`. Errors contain `error_code` and
 `error_message`: `001` means an unknown/duplicate field, and `002` means an invalid
 value or a storage failure. Text must contain at least three characters and must
 not look like a URL or a hash.
@@ -42,6 +46,24 @@ not look like a URL or a hash.
 `file_handle_store/`. `image_hash` accepts a 16–64 character alphanumeric handle;
 the existing implementation does not check that the handle exists. If both image
 fields are supplied, the ingested image's hash takes precedence.
+
+`video_id` must name a video owned by the ad's `creator_id`. A missing video and
+another account's video both return `002` for `video_id`, so callers cannot tell
+which IDs exist. Combining `video_id` with `image` or `image_hash` also returns
+`002` for `video_id`.
+
+A video contains `id`, `name`, `owner_id` (the owning ad account), `upload_time`
+(Unix seconds), and `video_hash`. Only the name can change; the other fields are
+fixed at upload. `file` must be an existing local file ending in `.mp4`, `.mov`,
+`.m4v`, `.webm`, `.mkv`, or `.avi`; the extension is the only format check. Video
+errors use `owner_id`, `name`, `file`, or `video_id` as the field.
+
+`list_videos` pages by cursor. Pass the previous response's `next_cursor` to get
+the next page; it is `None` on the last page. Treat cursors as opaque. Pages
+never repeat or skip videos when new uploads arrive between requests. `limit`
+defaults to 25 (maximum 100). `since` (inclusive) and `until` (exclusive) filter
+by `upload_time` in Unix seconds and can be combined with a cursor. Invalid
+parameters return `002` for `owner_id`, `limit`, `cursor`, `since`, or `until`.
 
 ## Objects and code structure
 
@@ -56,6 +78,7 @@ and metadata. The existing functions in `publish.py` still return dictionaries.
 | `validation.py` | Account, ad input, and read projection validation. |
 | `publishing.py` | `AdPublisher`: validate input, normalize the image, persist the ad. |
 | `service.py` | `AdsService` object API for accounts and ads. |
+| `video_store.py` | Local video storage: copies uploaded files in, addressed by content hash. |
 | `publish.py` | Compatibility API that translates objects and errors into dictionaries. |
 
 Use the object API to work directly with accounts and ads:
@@ -79,8 +102,9 @@ print(service.get_ad(ad.id).to_dict())
 
 The object API raises `ValidationError` for invalid input and propagates storage
 failures. The compatibility functions preserve their error dictionaries and
-missing-record behavior. The SQLite schema is unchanged, so existing data works
-with either API.
+missing-record behavior. Databases created before video support gain the
+`videos` table and the `ads.video_id` column automatically; existing rows read
+back with `video_id: None`.
 
 ## Extending validation and publishing
 
@@ -117,6 +141,8 @@ By default, generated data lives beside the modules under `data/`:
 
 - `ads.db`: SQLite accounts and ads.
 - `image_store_data/`: copied local files and `persisted_images.json`.
+- `videos/`: uploaded video files, named by the first 32 hex characters of their
+  SHA-256. Identical uploads share one file.
 
 Set `ADS_STACK_DATA_DIR` before importing the modules to use another location:
 
@@ -149,7 +175,7 @@ They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The suite has 44 tests, including boundary cases, storage failures, rollback, and
+The suite has 64 tests, including boundary cases, storage failures, rollback, and
 concurrent SQLite ad ID allocation. See [VERIFICATION.md](VERIFICATION.md) for
 the test audit, deliberate regression checks, bugs fixed, and remaining limits.
 

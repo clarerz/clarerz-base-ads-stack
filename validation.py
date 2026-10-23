@@ -8,6 +8,10 @@ from models import AdAccount, AdDraft
 
 URL_REGEX = re.compile(r"^https?://[^\s]+$")
 HASH_REGEX = re.compile(r"^[A-Za-z0-9]{16,64}$")
+VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"})
+DEFAULT_PAGE_SIZE = 25
+MAX_PAGE_SIZE = 100
+_MAX_SQLITE_INT = 2**63 - 1
 
 
 class ValidationError(ValueError):
@@ -46,7 +50,7 @@ class AccountValidator:
 
 
 class AdValidator:
-    allowed_fields = frozenset({"creator_id", "text", "image", "image_hash"})
+    allowed_fields = frozenset({"creator_id", "text", "image", "image_hash", "video_id"})
 
     def __init__(self, repository, base_dir=None, rules=()):
         self.repository = repository
@@ -62,15 +66,21 @@ class AdValidator:
                 raise ValidationError("001", field)
         if "text" not in data:
             raise ValidationError("002", "text")
-        if "image" not in data and "image_hash" not in data:
+        has_image = "image" in data or "image_hash" in data
+        if not has_image and "video_id" not in data:
             raise ValidationError("002", "image")
+        if has_image and "video_id" in data:
+            # An ad is either an image ad or a video ad.
+            raise ValidationError("002", "video_id")
         if "creator_id" not in data:
             raise ValidationError("002", "creator_id")
         creator_id = self.validate_creator(data["creator_id"])
         text = self.validate_text(data["text"])
         image = self.validate_image(data["image"]) if "image" in data else None
         image_hash = self.validate_hash(data["image_hash"]) if "image_hash" in data else None
-        draft = AdDraft(creator_id, text, image, image_hash)
+        video_id = (self.validate_video(data["video_id"], creator_id)
+                    if "video_id" in data else None)
+        draft = AdDraft(creator_id, text, image, image_hash, video_id)
         for rule in self.rules:
             rule(draft)
         return draft
@@ -117,6 +127,103 @@ class AdValidator:
         if not isinstance(value, str) or not HASH_REGEX.match(value.strip()):
             raise ValidationError("002", "image_hash")
         return value.strip()
+
+    def validate_video(self, value, creator_id):
+        # The creator must own the video. Missing and unowned videos get the same
+        # error so callers cannot probe which video IDs exist.
+        video_id = coerce_id(value)
+        if video_id is None:
+            raise ValidationError("002", "video_id")
+        try:
+            video = self.repository.get_video(video_id)
+        except Exception as exc:
+            raise ValidationError("002", "video_id") from exc
+        if video is None or video.owner_id != creator_id:
+            raise ValidationError("002", "video_id")
+        return video_id
+
+
+def validate_video_name(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("002", "name")
+    return value.strip()
+
+
+class VideoValidator:
+    allowed_fields = frozenset({"owner_id", "name", "file"})
+
+    def __init__(self, repository):
+        self.repository = repository
+
+    def validate(self, data):
+        """Return (owner_id, name, absolute file path) for a valid upload request."""
+        if not isinstance(data, dict):
+            raise ValidationError("002", "data")
+        for field in data:
+            if field not in self.allowed_fields:
+                raise ValidationError("001", field)
+        for field in ("owner_id", "name", "file"):
+            if field not in data:
+                raise ValidationError("002", field)
+        return (self.validate_owner(data["owner_id"]), validate_video_name(data["name"]),
+                self.validate_file(data["file"]))
+
+    def validate_owner(self, value):
+        owner_id = coerce_id(value)
+        if owner_id is None:
+            raise ValidationError("002", "owner_id")
+        try:
+            account = self.repository.get_account(owner_id)
+        except Exception as exc:
+            raise ValidationError("002", "owner_id") from exc
+        if account is None:
+            raise ValidationError("002", "owner_id")
+        return owner_id
+
+    def validate_file(self, value):
+        # Uploads come from local files only; the extension is the only format check.
+        if not isinstance(value, str) or not value.strip():
+            raise ValidationError("002", "file")
+        path = Path(value.strip()).expanduser()
+        if path.suffix.lower() not in VIDEO_EXTENSIONS or not path.is_file():
+            raise ValidationError("002", "file")
+        return str(path.resolve())
+
+    def validate_query(self, owner_id, limit=None, cursor=None, since=None, until=None):
+        """Return (owner_id, limit, cursor position, since, until) for a video listing."""
+        owner_id = self.validate_owner(owner_id)
+        if limit is None:
+            limit = DEFAULT_PAGE_SIZE
+        else:
+            limit = coerce_id(limit)
+            if limit is None or not 1 <= limit <= MAX_PAGE_SIZE:
+                raise ValidationError("002", "limit")
+        return (owner_id, limit, decode_cursor(cursor),
+                _optional_time(since, "since"), _optional_time(until, "until"))
+
+
+def _optional_time(value, field):
+    if value is None:
+        return None
+    timestamp = coerce_id(value)
+    if timestamp is None or not 0 <= timestamp <= _MAX_SQLITE_INT:
+        raise ValidationError("002", field)
+    return timestamp
+
+
+def encode_cursor(video):
+    return f"{video.upload_time}:{video.id}"
+
+
+def decode_cursor(value):
+    """Return the (upload_time, id) position after which the next page starts."""
+    if value is None:
+        return None
+    parts = value.split(":") if isinstance(value, str) else ()
+    position = tuple(coerce_id(part) for part in parts)
+    if len(position) != 2 or None in position or max(position) > _MAX_SQLITE_INT:
+        raise ValidationError("002", "cursor")
+    return position
 
 
 class ProjectionValidator:

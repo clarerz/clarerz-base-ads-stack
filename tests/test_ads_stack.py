@@ -34,7 +34,7 @@ class AdsStackTests(unittest.TestCase):
         modules.start()
         self.addCleanup(modules.stop)
         # Load fresh modules after setting storage, without creating project data.
-        for name in ("models", "repository", "validation", "image_store",
+        for name in ("models", "repository", "validation", "image_store", "video_store",
                      "publishing", "service", "publish"):
             spec = importlib.util.spec_from_file_location(name, BASE_DIR / f"{name}.py")
             module = importlib.util.module_from_spec(spec)
@@ -329,7 +329,12 @@ class AdsStackTests(unittest.TestCase):
         ad = service.get_ad(7)
         self.assertEqual(ad, self.models.Ad(7, "ad_7", self.seeded[0]["hash"],
                                            VALID_TEXT, 1, 1234567890))
+        self.assertIsNone(ad.video_id)
         self.assertEqual(service.publish_ad(self.payload()).id, 8)
+        # The legacy ads table gains video_id in place and accepts video ads.
+        video = repository.save_video(1, "Legacy video", "a" * 32, 1234567890)
+        video_ad = service.publish_ad({"creator_id": 1, "text": VALID_TEXT, "video_id": video.id})
+        self.assertEqual(service.get_ad(video_ad.id).video_id, video.id)
 
     def test_input_shapes_and_required_fields(self):
         for data in (None, [], "invalid", 1):
@@ -486,6 +491,254 @@ class AdsStackTests(unittest.TestCase):
                 matches = [entry for entry in self.image_store.list_images()
                            if entry["hash"] == ads[0]["image_hash"]]
                 self.assertEqual(len(matches), 1)
+
+    def video_file(self, name="clip.mp4", content=b"FAKE_VIDEO_BYTES"):
+        path = self.data_dir / "uploads" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(content)
+        return str(path)
+
+    def video_payload(self, **changes):
+        data = {"owner_id": 1, "name": "Launch teaser", "file": self.video_file()}
+        data.update(changes)
+        return data
+
+    def video_repository(self):
+        return self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+
+    def test_upload_video_persists_metadata_and_bytes(self):
+        before = int(time.time())
+        response = self.publish.upload_video(self.video_payload(name="  Launch teaser  "))
+        self.assertEqual(set(response), {"id"})
+        video = self.video_repository().get_video(response["id"])
+        expected_hash = hashlib.sha256(b"FAKE_VIDEO_BYTES").hexdigest()[:32]
+        self.assertEqual((video.name, video.owner_id, video.video_hash),
+                         ("Launch teaser", 1, expected_hash))
+        self.assertLessEqual(before, video.upload_time)
+        self.assertLessEqual(video.upload_time, int(time.time()))
+        stored = self.video_store.VIDEO_DIR / expected_hash
+        self.assertEqual(stored.read_bytes(), b"FAKE_VIDEO_BYTES")
+        self.assertTrue(stored.is_relative_to(self.data_dir))
+        # Durable across processes, and the source file is not needed after upload.
+        Path(self.video_payload()["file"]).unlink()
+        fresh = self.fresh_process(
+            "import json, publish; from repository import SQLiteAdsRepository; "
+            f"print(json.dumps(SQLiteAdsRepository(publish.DB_PATH).get_video({video.id}).to_dict()))"
+        )
+        self.assertEqual(fresh, video.to_dict())
+
+    def test_upload_video_ids_unique_and_content_deduplicated(self):
+        ids = [self.publish.upload_video(self.video_payload())["id"] for _ in range(2)]
+        self.assertNotEqual(*ids)
+        self.assertEqual(len(list(self.video_store.VIDEO_DIR.iterdir())), 1)
+
+    def test_upload_video_owner_must_exist(self):
+        self.assertEqual(self.publish.create_account(2, "Advertiser Two"), {"id": 2})
+        video_id = self.publish.upload_video(self.video_payload(owner_id="2"))["id"]
+        self.assertEqual(self.video_repository().get_video(video_id).owner_id, 2)
+        for owner in (999999999, None, True, "invalid", "²"):
+            with self.subTest(owner=owner):
+                self.assert_error(self.publish.upload_video(self.video_payload(owner_id=owner)),
+                                  "002", "owner_id")
+
+    def test_upload_video_input_validation(self):
+        self.video_file("notes.txt")
+        directory = self.data_dir / "uploads" / "folder.mp4"
+        directory.mkdir(parents=True)
+        cases = [(data, "002", "data") for data in (None, [], "invalid")]
+        cases.append((self.video_payload(unknown=1), "001", "unknown"))
+        for field in ("owner_id", "name", "file"):
+            data = self.video_payload()
+            del data[field]
+            cases.append((data, "002", field))
+        for name in ("", "  ", None, 123):
+            cases.append((self.video_payload(name=name), "002", "name"))
+        for file in ("", None, str(self.data_dir / "missing.mp4"), str(directory),
+                     str(self.data_dir / "uploads" / "notes.txt"), "https://cdn.example.com/a.mp4"):
+            cases.append((self.video_payload(file=file), "002", "file"))
+        for data, code, field in cases:
+            with self.subTest(data=data):
+                self.assert_error(self.publish.upload_video(data), code, field)
+        self.assertIsNone(self.video_repository().get_video(1))
+        self.assertFalse(self.video_store.VIDEO_DIR.exists())
+
+    def test_upload_video_storage_failure_does_not_persist(self):
+        storage = Mock()
+        storage.store_video.side_effect = OSError("Disk full")
+        service = self.service.AdsService(self.video_repository(), video_storage=storage)
+        with self.assertRaises(self.validation.ValidationError) as caught:
+            service.upload_video(self.video_payload())
+        self.assert_error(caught.exception.to_dict(), "002", "file")
+        self.assertIsNone(self.video_repository().get_video(1))
+
+    def test_failed_copy_leaves_no_partial_video(self):
+        # Fail mid-copy, after the temporary file exists.
+        digest = Mock()
+        digest.update.side_effect = RuntimeError("Read failed")
+        with patch.object(self.video_store.hashlib, "sha256", return_value=digest):
+            self.assert_error(self.publish.upload_video(self.video_payload()), "002", "file")
+        self.assertEqual(list(self.video_store.VIDEO_DIR.iterdir()), [])
+
+    def test_rename_video_changes_only_name(self):
+        video_id = self.publish.upload_video(self.video_payload())["id"]
+        original = self.video_repository().get_video(video_id)
+        self.assertEqual(self.publish.rename_video(str(video_id), "  Final cut  "), {"id": video_id})
+        renamed = self.video_repository().get_video(video_id)
+        self.assertEqual(renamed, self.models.Video(video_id, "Final cut", original.owner_id,
+                                                    original.upload_time, original.video_hash))
+        for video_id_value, name, field in ((999999, "Name", "video_id"), ("x", "Name", "video_id"),
+                                            (True, "Name", "video_id"), (video_id, " ", "name")):
+            with self.subTest(video_id=video_id_value, name=name):
+                self.assert_error(self.publish.rename_video(video_id_value, name), "002", field)
+        self.assertEqual(self.video_repository().get_video(video_id).name, "Final cut")
+
+    def test_video_fields_cannot_be_reassigned(self):
+        from dataclasses import FrozenInstanceError
+
+        video = self.service.AdsService(self.video_repository()).upload_video(self.video_payload())
+        self.assertIsInstance(video, self.models.Video)
+        for field in ("id", "name", "owner_id", "upload_time", "video_hash"):
+            with self.subTest(field=field):
+                with self.assertRaises(FrozenInstanceError):
+                    setattr(video, field, "Changed")
+
+    def seed_videos(self, upload_times, owner_id=1):
+        repository = self.video_repository()
+        return [repository.save_video(owner_id, f"Video {i}", "a" * 32, upload_time).to_dict()
+                for i, upload_time in enumerate(upload_times)]
+
+    def list_all_pages(self, **kwargs):
+        pages, cursor = [], None
+        while True:
+            page = self.publish.list_videos(1, cursor=cursor, **kwargs)
+            self.assertEqual(set(page), {"data", "next_cursor"}, page)
+            pages.append(page["data"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                return pages
+
+    def test_list_videos_paginates_newest_first(self):
+        self.publish.create_account(2, "Other Advertiser")
+        # Equal upload times are ordered by ID, newest first.
+        videos = self.seed_videos([100, 300, 200, 300, 100])
+        self.seed_videos([250], owner_id=2)
+        expected = [videos[i] for i in (3, 1, 2, 4, 0)]
+        pages = self.list_all_pages(limit=2)
+        self.assertEqual([len(page) for page in pages], [2, 2, 1])
+        self.assertEqual([video for page in pages for video in page], expected)
+        self.assertEqual(self.publish.list_videos(1, limit="5"),
+                         {"data": expected, "next_cursor": None})
+
+    def test_list_videos_default_page_size(self):
+        videos = self.seed_videos(range(26))
+        first = self.publish.list_videos(1)
+        self.assertEqual(first["data"], videos[:0:-1])
+        second = self.publish.list_videos(1, cursor=first["next_cursor"])
+        self.assertEqual(second, {"data": [videos[0]], "next_cursor": None})
+
+    def test_list_videos_filters_by_upload_time(self):
+        videos = self.seed_videos([100, 200, 200, 300, 400])
+        # since is inclusive and until is exclusive.
+        pages = self.list_all_pages(limit=1, since=200, until="400")
+        self.assertEqual([video for page in pages for video in page],
+                         [videos[3], videos[2], videos[1]])
+        self.assertEqual(self.publish.list_videos(1, since=401)["data"], [])
+        self.assertEqual(self.publish.list_videos(1, since=300, until=300)["data"], [])
+        self.assertEqual(self.publish.list_videos(1, until=101)["data"], [videos[0]])
+
+    def test_list_videos_pages_stable_across_new_uploads(self):
+        videos = self.seed_videos([100, 200, 300])
+        first = self.publish.list_videos(1, limit=2)
+        self.seed_videos([500])
+        second = self.publish.list_videos(1, limit=2, cursor=first["next_cursor"])
+        self.assertEqual(first["data"] + second["data"], [videos[2], videos[1], videos[0]])
+
+    def test_list_videos_empty_and_object_api(self):
+        self.assertEqual(self.publish.list_videos(1), {"data": [], "next_cursor": None})
+        uploaded = self.service.AdsService(self.video_repository()).upload_video(self.video_payload())
+        videos, next_cursor = self.object_service().list_videos(1)
+        self.assertEqual((videos, next_cursor), ([uploaded], None))
+        self.assertIsInstance(videos[0], self.models.Video)
+
+    def test_list_videos_rejects_invalid_parameters(self):
+        self.seed_videos([100])
+        cases = [({"owner_id": owner}, "owner_id") for owner in (999999999, None, True, "x", "²")]
+        cases += [({"limit": limit}, "limit") for limit in (0, 101, -1, "x", True, 1.5)]
+        cases += [({"cursor": cursor}, "cursor")
+                  for cursor in ("", "abc", "1:2:3", "a:b", "1:", 5, "-1:2", f"{2**63}:1")]
+        for field in ("since", "until"):
+            cases += [({field: value}, field) for value in (-1, "x", True, 1.5, 2**63)]
+        for kwargs, field in cases:
+            with self.subTest(kwargs=kwargs):
+                kwargs = {"owner_id": 1, **kwargs}
+                self.assert_error(self.publish.list_videos(**kwargs), "002", field)
+                with self.assertRaises(self.validation.ValidationError):
+                    self.object_service().list_videos(**kwargs)
+
+    def test_list_videos_storage_failure(self):
+        repository = Mock()
+        repository.get_account.return_value = self.models.AdAccount(1, "Advertiser")
+        repository.list_videos.side_effect = OSError("DB unavailable")
+        with patch.object(self.publish, "_service",
+                          return_value=self.service.AdsService(repository)):
+            self.assert_error(self.publish.list_videos(1), "002", "videos")
+
+    def video_ad_payload(self, video_id, **changes):
+        data = {"creator_id": 1, "text": VALID_TEXT, "video_id": video_id}
+        data.update(changes)
+        return data
+
+    def test_publish_video_ad(self):
+        video_id = self.publish.upload_video(self.video_payload())["id"]
+        before = int(time.time())
+        ad_id = self.publish_ok(self.video_ad_payload(str(video_id)))
+        ad = self.publish.get_ad(ad_id)
+        self.assertLessEqual(before, ad["creation_time"])
+        self.assertEqual(ad, {"id": ad_id, "system_name": f"ad_{ad_id}", "image_hash": None,
+                              "text": VALID_TEXT, "creator_id": 1,
+                              "creation_time": ad["creation_time"], "video_id": video_id})
+        self.assertEqual(self.publish.get_ads(ad_id, ["video_id"]), {"video_id": video_id})
+        fresh = self.fresh_process(f"import json, publish; print(json.dumps(publish.get_ad({ad_id})))")
+        self.assertEqual(fresh, ad)
+
+    def test_image_ads_have_no_video(self):
+        ad = self.publish.get_ad(self.publish_ok())
+        self.assertIsNone(ad["video_id"])
+        self.assertEqual(ad["image_hash"], self.seeded[0]["hash"])
+
+    def test_video_ad_requires_creator_to_own_video(self):
+        self.publish.create_account(2, "Advertiser Two")
+        other_video = self.publish.upload_video(self.video_payload(owner_id=2))["id"]
+        # Missing and unowned videos are indistinguishable to the caller.
+        for video_id in (other_video, 999999, None, True, "x", "²", 1.5, 2**63):
+            with self.subTest(video_id=video_id):
+                self.assert_error(self.publish.publish_ad(self.video_ad_payload(video_id)),
+                                  "002", "video_id")
+        self.assertIsNone(self.publish.get_ad(1))
+        # The owner can use it.
+        ad_id = self.publish_ok(self.video_ad_payload(other_video, creator_id=2))
+        self.assertEqual(self.publish.get_ad(ad_id)["video_id"], other_video)
+
+    def test_video_ad_rejects_image_fields(self):
+        video_id = self.publish.upload_video(self.video_payload())["id"]
+        storage = Mock()
+        publisher = self.publishing.AdPublisher(self.video_repository(), image_storage=storage)
+        for extra in ({"image": NEW_URL}, {"image_hash": "a" * 32}):
+            with self.subTest(extra=extra):
+                with self.assertRaises(self.validation.ValidationError) as caught:
+                    publisher.publish(self.video_ad_payload(video_id, **extra))
+                self.assert_error(caught.exception.to_dict(), "002", "video_id")
+        storage.store_image.assert_not_called()
+        self.assertIsNone(self.publish.get_ad(1))
+
+    def test_video_lookup_failure_rejects_video_ad(self):
+        repository = Mock()
+        repository.get_account.return_value = self.models.AdAccount(1, "Advertiser")
+        repository.get_video.side_effect = OSError("DB unavailable")
+        with self.assertRaises(self.validation.ValidationError) as caught:
+            self.service.AdsService(repository).publish_ad(self.video_ad_payload(1))
+        self.assert_error(caught.exception.to_dict(), "002", "video_id")
+        repository.save_ad.assert_not_called()
 
 
 if __name__ == "__main__":

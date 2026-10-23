@@ -59,3 +59,33 @@ def get_ads(ad_id, fields=None):
 
 def get_ad(ad_id):
     return get_ads(ad_id)
+
+
+def upload_video(data):
+    try:
+        video = _service().upload_video(data)
+        return {"id": video.id}
+    except ValidationError as exc:
+        return exc.to_dict()
+    except Exception:
+        return ValidationError("002", "data").to_dict()
+
+
+def rename_video(video_id, name):
+    try:
+        video = _service().rename_video(video_id, name)
+        return {"id": video.id}
+    except ValidationError as exc:
+        return exc.to_dict()
+    except Exception:
+        return ValidationError("002", "video").to_dict()
+
+
+def list_videos(owner_id, limit=None, cursor=None, since=None, until=None):
+    try:
+        videos, next_cursor = _service().list_videos(owner_id, limit, cursor, since, until)
+        return {"data": [video.to_dict() for video in videos], "next_cursor": next_cursor}
+    except ValidationError as exc:
+        return exc.to_dict()
+    except Exception:
+        return ValidationError("002", "videos").to_dict()
