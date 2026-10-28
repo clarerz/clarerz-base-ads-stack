@@ -5,7 +5,7 @@ from pathlib import Path
 import sqlite3
 from typing import Optional, Protocol
 
-from models import Ad, AdAccount, AdDraft, Video
+from models import Ad, AdAccount, AdDraft, Image, Video
 
 
 class AdsRepository(Protocol):
@@ -14,8 +14,10 @@ class AdsRepository(Protocol):
     def get_account(self, account_id: int) -> Optional[AdAccount]: ...
     def get_token_hash(self, account_id: int) -> Optional[str]: ...
     def set_token_hash(self, account_id: int, token_hash: str) -> bool: ...
-    def grant_image(self, owner_id: int, image_hash: str) -> None: ...
+    def grant_image(self, owner_id: int, image_hash: str, creation_time: int) -> None: ...
     def owns_image(self, owner_id: int, image_hash: str) -> bool: ...
+    def list_images(self, owner_id: int, limit: int, after: Optional[tuple] = None,
+                    since: Optional[int] = None, until: Optional[int] = None) -> list: ...
     def save_ad(self, draft: AdDraft, creation_time: int) -> Ad: ...
     def get_ad(self, ad_id: int) -> Optional[Ad]: ...
     def save_video(self, owner_id: int, name: str, video_hash: str, upload_time: int) -> Video: ...
@@ -50,7 +52,10 @@ class SQLiteAdsRepository:
                          "ON videos (owner_id, upload_time)")
             # Identical image bytes share one hash; each account that ingested them owns it.
             conn.execute("CREATE TABLE IF NOT EXISTS image_owners (owner_id INTEGER, "
-                         "image_hash TEXT, PRIMARY KEY (owner_id, image_hash))")
+                         "image_hash TEXT, creation_time INTEGER, "
+                         "PRIMARY KEY (owner_id, image_hash))")
+            conn.execute("CREATE INDEX IF NOT EXISTS image_owners_by_owner_time "
+                         "ON image_owners (owner_id, creation_time)")
         except Exception:
             conn.close()
             raise
@@ -99,10 +104,11 @@ class SQLiteAdsRepository:
                                   (token_hash, account_id))
         return cursor.rowcount == 1
 
-    def grant_image(self, owner_id, image_hash):
+    def grant_image(self, owner_id, image_hash, creation_time):
+        # Re-ingesting an owned image keeps its original creation time.
         with closing(self._connect()) as conn, conn:
-            conn.execute("INSERT OR IGNORE INTO image_owners (owner_id, image_hash) VALUES (?, ?)",
-                         (owner_id, image_hash))
+            conn.execute("INSERT OR IGNORE INTO image_owners (owner_id, image_hash, creation_time) "
+                         "VALUES (?, ?, ?)", (owner_id, image_hash, creation_time))
 
     def owns_image(self, owner_id, image_hash):
         with closing(self._connect()) as conn:
@@ -153,23 +159,34 @@ class SQLiteAdsRepository:
 
     def list_videos(self, owner_id, limit, after=None, since=None, until=None):
         """Newest first; `after` is the (upload_time, id) of the previous page's last video."""
+        rows = self._list_page("SELECT id, name, owner_id, upload_time, video_hash FROM videos",
+                               "upload_time", "id", owner_id, limit, after, since, until)
+        return [Video(*row) for row in rows]
+
+    def list_images(self, owner_id, limit, after=None, since=None, until=None):
+        """Newest first; `after` is the (creation_time, hash) of the previous page's last image."""
+        rows = self._list_page("SELECT image_hash, owner_id, creation_time FROM image_owners",
+                               "creation_time", "image_hash", owner_id, limit, after, since, until)
+        return [Image(*row) for row in rows]
+
+    def _list_page(self, select, time_column, key_column, owner_id, limit, after, since, until):
+        # Keyset pagination: rows added after the first page never shift later pages.
         clauses, params = ["owner_id = ?"], [owner_id]
         if after is not None:
-            clauses.append("(upload_time, id) < (?, ?)")
+            clauses.append(f"({time_column}, {key_column}) < (?, ?)")
             params.extend(after)
         if since is not None:
-            clauses.append("upload_time >= ?")
+            clauses.append(f"{time_column} >= ?")
             params.append(since)
         if until is not None:
-            clauses.append("upload_time < ?")
+            clauses.append(f"{time_column} < ?")
             params.append(until)
         with closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT id, name, owner_id, upload_time, video_hash FROM videos "
-                f"WHERE {' AND '.join(clauses)} ORDER BY upload_time DESC, id DESC LIMIT ?",
+            return conn.execute(
+                f"{select} WHERE {' AND '.join(clauses)} "
+                f"ORDER BY {time_column} DESC, {key_column} DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
-        return [Video(*row) for row in rows]
 
     def _select_video(self, conn, video_id):
         row = conn.execute(

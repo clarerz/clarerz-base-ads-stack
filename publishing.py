@@ -12,7 +12,7 @@ class ImageStorage(Protocol):
     def store_image(self, image_input: str) -> dict: ...
 
 
-def store_owned_image(repository, image_storage, owner_id, image_input, field):
+def store_owned_image(repository, image_storage, owner_id, image_input, field, creation_time):
     """Ingest an image, record owner_id as an owner of its hash, and return the hash."""
     try:
         image_hash = image_storage.store_image(image_input)["hash"]
@@ -20,7 +20,7 @@ def store_owned_image(repository, image_storage, owner_id, image_input, field):
             raise ValueError("Image storage returned an invalid handle")
     except Exception as exc:
         raise ValidationError("002", field) from exc
-    repository.grant_image(owner_id, image_hash)
+    repository.grant_image(owner_id, image_hash, creation_time)
     return image_hash
 
 
@@ -40,7 +40,7 @@ class AdPublisher:
         if draft.image is None:
             return draft
         image_hash = store_owned_image(self.repository, self.image_storage, draft.creator_id,
-                                       draft.image, "image")
+                                       draft.image, "image", int(self.clock()))
         return replace(draft, image=None, image_hash=image_hash)
 
     def persist(self, draft):

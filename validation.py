@@ -180,7 +180,7 @@ def validate_video_name(value):
 
 
 class UploadValidator:
-    """Image uploads; videos extend it. The owner must authenticate before anything is stored."""
+    """Image uploads and listings; videos extend it. Uploads authenticate the owner first."""
 
     required_fields = ("owner_id", "access_token", "file")
 
@@ -205,6 +205,21 @@ class UploadValidator:
         owner_id = self.validate_owner(data["owner_id"])
         authenticate(self.repository, owner_id, data["access_token"])
         return owner_id
+
+    def validate_query(self, owner_id, limit=None, cursor=None, since=None, until=None):
+        """Return (owner_id, limit, cursor position, since, until) for a listing."""
+        owner_id = self.validate_owner(owner_id)
+        if limit is None:
+            limit = DEFAULT_PAGE_SIZE
+        else:
+            limit = coerce_id(limit)
+            if limit is None or not 1 <= limit <= MAX_PAGE_SIZE:
+                raise ValidationError("002", "limit")
+        return (owner_id, limit, self.decode_cursor(cursor),
+                _optional_time(since, "since"), _optional_time(until, "until"))
+
+    def decode_cursor(self, value):
+        return decode_image_cursor(value)
 
     def validate_owner(self, value):
         owner_id = coerce_id(value)
@@ -243,17 +258,9 @@ class VideoValidator(UploadValidator):
             raise ValidationError("002", "file")
         return path
 
-    def validate_query(self, owner_id, limit=None, cursor=None, since=None, until=None):
-        """Return (owner_id, limit, cursor position, since, until) for a video listing."""
-        owner_id = self.validate_owner(owner_id)
-        if limit is None:
-            limit = DEFAULT_PAGE_SIZE
-        else:
-            limit = coerce_id(limit)
-            if limit is None or not 1 <= limit <= MAX_PAGE_SIZE:
-                raise ValidationError("002", "limit")
-        return (owner_id, limit, decode_cursor(cursor),
-                _optional_time(since, "since"), _optional_time(until, "until"))
+    def decode_cursor(self, value):
+        return decode_video_cursor(value)
+
 
 
 def _optional_time(value, field):
@@ -265,11 +272,11 @@ def _optional_time(value, field):
     return timestamp
 
 
-def encode_cursor(video):
+def encode_video_cursor(video):
     return f"{video.upload_time}:{video.id}"
 
 
-def decode_cursor(value):
+def decode_video_cursor(value):
     """Return the (upload_time, id) position after which the next page starts."""
     if value is None:
         return None
@@ -278,6 +285,22 @@ def decode_cursor(value):
     if len(position) != 2 or None in position or max(position) > _MAX_SQLITE_INT:
         raise ValidationError("002", "cursor")
     return position
+
+
+def encode_image_cursor(image):
+    return f"{image.creation_time}:{image.hash}"
+
+
+def decode_image_cursor(value):
+    """Return the (creation_time, hash) position after which the next page starts."""
+    if value is None:
+        return None
+    timestamp, _, image_hash = value.partition(":") if isinstance(value, str) else ("", "", "")
+    timestamp = coerce_id(timestamp)
+    if (timestamp is None or timestamp > _MAX_SQLITE_INT
+            or not HASH_REGEX.fullmatch(image_hash)):
+        raise ValidationError("002", "cursor")
+    return timestamp, image_hash
 
 
 class ProjectionValidator:
@@ -295,3 +318,4 @@ class ProjectionValidator:
             if not isinstance(field, str) or field not in data:
                 raise ValidationError("001", field)
         return {field: data[field] for field in fields}
+

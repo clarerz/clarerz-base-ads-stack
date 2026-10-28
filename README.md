@@ -34,6 +34,7 @@ PY
 | `get_account(account_id)` | Return `id` and `name`, or `None` if missing/invalid. |
 | `publish_ad(data)` | Require an existing `creator_id`, its `access_token`, one `text` field, and either `image`/`image_hash` (image ad) or `video_id` (video ad). Return a numeric ad ID or an error. |
 | `upload_image(data)` | Require an existing `owner_id`, its `access_token`, and a local image `file` path. Return `{"hash": ...}` or an error. |
+| `list_images(owner_id, access_token, limit=None, cursor=None, since=None, until=None)` | Return one page of the images the account owns, newest first: `{"data": [...], "next_cursor": ...}`. |
 | `get_ads(ad_id, fields=None)` | Return the stored ad or requested fields; unknown fields return an error. |
 | `get_ad(ad_id)` | Return the full stored ad, or `None` if missing/invalid. |
 | `upload_video(data)` | Require an existing `owner_id`, its `access_token`, a nonblank `name`, and a local video `file` path. Return a numeric video ID or an error. |
@@ -43,7 +44,8 @@ PY
 ## Authentication
 
 Every write to account-owned data needs the account's access token: renaming the
-account, publishing, and uploading images or videos. Reads need no token.
+account, publishing, and uploading images or videos. Listing an account's images
+needs it too; other reads need no token.
 `create_account` returns the token once; only its SHA-256 hash is stored, so a lost
 token cannot be recovered. A missing or wrong token returns `002` for
 `access_token`. Validation authenticates before checking image or video ownership,
@@ -90,12 +92,17 @@ fixed at upload. `file` must be an existing local file ending in `.mp4`, `.mov`,
 `.m4v`, `.webm`, `.mkv`, or `.avi`; the extension is the only format check. Video
 errors use `owner_id`, `name`, `file`, or `video_id` as the field.
 
-`list_videos` pages by cursor. Pass the previous response's `next_cursor` to get
+An owned image contains `hash`, `owner_id`, and `creation_time`: when that account
+first uploaded or ingested it (Unix seconds). Re-uploading keeps the original time.
+
+`list_videos` and `list_images` page by cursor. Pass the previous response's `next_cursor` to get
 the next page; it is `None` on the last page. Treat cursors as opaque. Pages
 never repeat or skip videos when new uploads arrive between requests. `limit`
 defaults to 25 (maximum 100). `since` (inclusive) and `until` (exclusive) filter
-by `upload_time` in Unix seconds and can be combined with a cursor. Invalid
-parameters return `002` for `owner_id`, `limit`, `cursor`, `since`, or `until`.
+by `upload_time` (videos) or `creation_time` (images) in Unix seconds and can be
+combined with a cursor. Ties are ordered by video ID or image hash, descending.
+Invalid parameters return `002` for `owner_id`, `limit`, `cursor`, `since`, or
+`until`; a wrong token for `list_images` returns `002` for `access_token`.
 
 ## Code structure
 
@@ -105,11 +112,11 @@ and metadata. The existing functions in `publish.py` still return dictionaries.
 
 | Module | Responsibility |
 | --- | --- |
-| `models.py` | `AdAccount`, `AdDraft`, and `Ad` objects. |
+| `models.py` | `AdAccount`, `AdDraft`, `Ad`, `Image`, and `Video` objects. |
 | `repository.py` | `AdsRepository` storage interface and SQLite implementation, including token hashes and image ownership. |
 | `validation.py` | Account, ad input, upload, and read projection validation; token checks. |
 | `publishing.py` | `AdPublisher`: validate input, ingest and claim the image, persist the ad. |
-| `service.py` | `AdsService` object API for accounts, ads, images, and videos. |
+| `service.py` | `AdsService` object API for accounts, ads, and image and video uploads and listings. |
 | `file_store.py` | Size-limited copy of a local file into storage, named by content hash. |
 | `video_store.py` | Local video storage on top of `file_store`. |
 | `publish.py` | Compatibility API that translates objects and errors into dictionaries. |
@@ -210,8 +217,8 @@ They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The suite has 70 tests, including boundary cases, storage failures, rollback, and
-concurrent SQLite ad ID allocation, token and ownership enforcement, and size limits. See [VERIFICATION.md](VERIFICATION.md) for
+The suite has 77 tests, including boundary cases, storage failures, rollback, and
+concurrent SQLite ad ID allocation, token and ownership enforcement, size limits, and image listing. See [VERIFICATION.md](VERIFICATION.md) for
 the test audit, deliberate regression checks, bugs fixed, and remaining limits.
 
 ## Source

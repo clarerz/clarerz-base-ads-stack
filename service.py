@@ -6,7 +6,8 @@ import time
 import image_store
 from publishing import AdPublisher, store_owned_image
 from validation import (AccountValidator, UploadValidator, ValidationError, VideoValidator,
-                        authenticate, coerce_id, encode_cursor, hash_token, validate_video_name)
+                        authenticate, coerce_id, encode_image_cursor, encode_video_cursor,
+                        hash_token, validate_video_name)
 import video_store
 
 
@@ -58,7 +59,19 @@ class AdsService:
     def upload_image(self, data):
         """Store an image for its authenticated owner and return the image's content hash."""
         owner_id, path = self.image_validator.validate(data)
-        return store_owned_image(self.repository, self.image_storage, owner_id, path, "file")
+        return store_owned_image(self.repository, self.image_storage, owner_id, path, "file",
+                                 int(time.time()))
+
+    def list_images(self, owner_id, access_token, limit=None, cursor=None, since=None,
+                    until=None):
+        """Return (images, next_cursor) for one page of the owner's images, newest first."""
+        owner_id, limit, after, since, until = self.image_validator.validate_query(
+            owner_id, limit, cursor, since, until)
+        authenticate(self.repository, owner_id, access_token)
+        # Fetch one extra row to learn whether another page exists.
+        images = self.repository.list_images(owner_id, limit + 1, after, since, until)
+        page = images[:limit]
+        return page, encode_image_cursor(page[-1]) if len(images) > limit else None
 
     def upload_video(self, data):
         owner_id, name, path = self.video_validator.validate(data)
@@ -89,4 +102,4 @@ class AdsService:
         # Fetch one extra row to learn whether another page exists.
         videos = self.repository.list_videos(owner_id, limit + 1, after, since, until)
         page = videos[:limit]
-        return page, encode_cursor(page[-1]) if len(videos) > limit else None
+        return page, encode_video_cursor(page[-1]) if len(videos) > limit else None

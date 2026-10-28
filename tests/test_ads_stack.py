@@ -287,13 +287,16 @@ class AdsStackTests(unittest.TestCase):
         publisher = self.publishing.AdPublisher(repository, image_storage=storage,
                                                clock=lambda: 1234567890)
         service = self.object_service(publisher=publisher)
-        repository.grant_image(1, "a" * 32)
+        repository.grant_image(1, "a" * 32, 1)
         # Image ingestion retains precedence over a supplied valid, owned hash.
         ad = service.publish_ad(self.payload(image=NEW_URL, image_hash="a" * 32))
         self.assertEqual(ad.image_hash, "f" * 32)
         self.assertEqual(ad.creation_time, 1234567890)
         self.assertEqual(service.get_ad(ad.id), ad)
         storage.store_image.assert_called_once_with(NEW_URL)
+        # The ingested image is owned from the injected clock's time.
+        images, _ = service.list_images(1, self.token)
+        self.assertIn(self.models.Image("f" * 32, 1, 1234567890), images)
 
     def test_custom_publish_stage(self):
         from dataclasses import replace
@@ -376,7 +379,7 @@ class AdsStackTests(unittest.TestCase):
                 self.assertEqual(caught.exception.field, "image_hash")
         for value in ("a" * 16, "b" * 64):
             with self.subTest(value=value):
-                repository.grant_image(1, value)
+                repository.grant_image(1, value, 1)
                 ad = publisher.publish({"creator_id": 1, "access_token": self.token,
                                         "text": VALID_TEXT, "image_hash": value})
                 self.assertEqual(ad.image_hash, value)
@@ -638,13 +641,15 @@ class AdsStackTests(unittest.TestCase):
 
     def list_all_pages(self, **kwargs):
         pages, cursor = [], None
-        while True:
+        # Bounded so a cursor that never ends fails instead of hanging.
+        for _ in range(50):
             page = self.publish.list_videos(1, cursor=cursor, **kwargs)
             self.assertEqual(set(page), {"data", "next_cursor"}, page)
             pages.append(page["data"])
             cursor = page["next_cursor"]
             if cursor is None:
                 return pages
+        self.fail("pagination did not end")
 
     def test_list_videos_paginates_newest_first(self):
         self.publish.create_account(2, "Other Advertiser")
@@ -890,6 +895,113 @@ class AdsStackTests(unittest.TestCase):
         self.assertEqual([path.name for path in self.video_store.VIDEO_DIR.iterdir()],
                          [hashlib.sha256(at_limit).hexdigest()[:32]])
         self.assertIsNone(self.video_repository().get_video(2))
+
+    def seed_images(self, creation_times, owner_id=1):
+        # Hash i is letter i repeated, so ties order by index descending.
+        repository = self.video_repository()
+        images = []
+        for i, creation_time in enumerate(creation_times):
+            image_hash = "abcdefghij"[i] * 32
+            repository.grant_image(owner_id, image_hash, creation_time)
+            images.append({"hash": image_hash, "owner_id": owner_id,
+                           "creation_time": creation_time})
+        return images
+
+    def list_all_image_pages(self, **kwargs):
+        pages, cursor = [], None
+        # Bounded so a cursor that never ends fails instead of hanging.
+        for _ in range(50):
+            page = self.publish.list_images(1, self.token, cursor=cursor, **kwargs)
+            self.assertEqual(set(page), {"data", "next_cursor"}, page)
+            pages.append(page["data"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                return pages
+        self.fail("pagination did not end")
+
+    def test_list_images_paginates_newest_first(self):
+        self.create_account(2, "Other Advertiser")
+        # Equal creation times are ordered by hash, descending.
+        images = self.seed_images([100, 300, 200, 300, 100])
+        self.seed_images([250], owner_id=2)
+        expected = [images[i] for i in (3, 1, 2, 4, 0)]
+        pages = self.list_all_image_pages(limit=2)
+        self.assertEqual([len(page) for page in pages], [2, 2, 1])
+        self.assertEqual([image for page in pages for image in page], expected)
+        self.assertEqual(self.publish.list_images(1, self.token, limit="5"),
+                         {"data": expected, "next_cursor": None})
+
+    def test_list_images_filters_by_creation_time(self):
+        images = self.seed_images([100, 200, 200, 300, 400])
+        # since is inclusive and until is exclusive.
+        pages = self.list_all_image_pages(limit=1, since=200, until="400")
+        self.assertEqual([image for page in pages for image in page],
+                         [images[3], images[2], images[1]])
+        self.assertEqual(self.publish.list_images(1, self.token, since=401)["data"], [])
+        self.assertEqual(self.publish.list_images(1, self.token, since=300, until=300)["data"], [])
+        self.assertEqual(self.publish.list_images(1, self.token, until=101)["data"], [images[0]])
+
+    def test_list_images_pages_stable_across_new_images(self):
+        images = self.seed_images([100, 200, 300])
+        first = self.publish.list_images(1, self.token, limit=2)
+        self.video_repository().grant_image(1, "z" * 32, 500)
+        second = self.publish.list_images(1, self.token, limit=2, cursor=first["next_cursor"])
+        self.assertEqual(first["data"] + second["data"], [images[2], images[1], images[0]])
+
+    def test_list_images_requires_owner_token(self):
+        other_token = self.create_account(2, "Advertiser Two")
+        self.seed_images([100])
+        for token in (None, "", "wrong", 123, other_token):
+            with self.subTest(token=token):
+                self.assert_error(self.publish.list_images(1, token), "002", "access_token")
+        for owner in (999999999, None, True, "x", "²"):
+            with self.subTest(owner=owner):
+                self.assert_error(self.publish.list_images(owner, self.token), "002", "owner_id")
+        # An account's own token lists only its own images.
+        self.assertEqual(self.publish.list_images(2, other_token),
+                         {"data": [], "next_cursor": None})
+
+    def test_list_images_shows_uploads_and_ingested_images(self):
+        before = int(time.time())
+        uploaded = self.image_upload()["hash"]
+        ingested = self.publish.get_ad(self.publish_ok())["image_hash"]
+        images, next_cursor = self.object_service().list_images("1", self.token)
+        self.assertIsNone(next_cursor)
+        self.assertEqual({image.hash for image in images}, {uploaded, ingested})
+        for image in images:
+            self.assertIsInstance(image, self.models.Image)
+            self.assertEqual(image.owner_id, 1)
+            self.assertLessEqual(before, image.creation_time)
+            self.assertLessEqual(image.creation_time, int(time.time()))
+        # Uploading the same bytes again keeps the original creation time.
+        with patch.object(self.service.time, "time", return_value=before + 1000):
+            self.assertEqual(self.image_upload(), {"hash": uploaded})
+        self.assertEqual(self.object_service().list_images(1, self.token)[0], images)
+
+    def test_list_images_rejects_invalid_parameters(self):
+        self.seed_images([100])
+        valid_hash = "a" * 32
+        cases = [({"limit": limit}, "limit") for limit in (0, 101, -1, "x", True, 1.5)]
+        cases += [({"cursor": cursor}, "cursor")
+                  for cursor in ("", "abc", "1:2", "1:", f":{valid_hash}", f"x:{valid_hash}",
+                                 f"-1:{valid_hash}", f"{2**63}:{valid_hash}", f"1:{'a' * 15}",
+                                 f"1:{valid_hash}\n", f"1:{valid_hash}:2", 5)]
+        for field in ("since", "until"):
+            cases += [({field: value}, field) for value in (-1, "x", True, 1.5, 2**63)]
+        for kwargs, field in cases:
+            with self.subTest(kwargs=kwargs):
+                self.assert_error(self.publish.list_images(1, self.token, **kwargs), "002", field)
+                with self.assertRaises(self.validation.ValidationError):
+                    self.object_service().list_images(1, self.token, **kwargs)
+
+    def test_list_images_storage_failure(self):
+        repository = Mock()
+        repository.get_account.return_value = self.models.AdAccount(1, "Advertiser")
+        repository.get_token_hash.return_value = self.validation.hash_token(self.token)
+        repository.list_images.side_effect = OSError("DB unavailable")
+        with patch.object(self.publish, "_service",
+                          return_value=self.service.AdsService(repository)):
+            self.assert_error(self.publish.list_images(1, self.token), "002", "images")
 
 if __name__ == "__main__":
     unittest.main()

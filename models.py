@@ -41,6 +41,18 @@ class Ad:
 
 
 @dataclass(frozen=True)
+class Image:
+    """An account's ownership of stored image content. Accounts sharing content share the hash."""
+
+    hash: str
+    owner_id: int
+    creation_time: int
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class Video:
     """Only the name can change, through a persisted rename; other fields are fixed at upload."""
 
