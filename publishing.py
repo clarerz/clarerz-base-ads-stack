@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 import time
-from typing import Protocol
+from typing import Optional, Protocol
 
 import image_store
 from validation import AdValidator, HASH_REGEX, ValidationError
@@ -10,9 +10,11 @@ from validation import AdValidator, HASH_REGEX, ValidationError
 
 class ImageStorage(Protocol):
     def store_image(self, image_input: str) -> dict: ...
+    def get_image_by_hash(self, hash_val: str) -> Optional[dict]: ...
 
 
-def store_owned_image(repository, image_storage, owner_id, image_input, field, creation_time):
+def store_owned_image(repository, image_storage, owner_id, image_input, field, creation_time,
+                      image_name=None):
     """Ingest an image, record owner_id as an owner of its hash, and return the hash."""
     try:
         image_hash = image_storage.store_image(image_input)["hash"]
@@ -20,15 +22,16 @@ def store_owned_image(repository, image_storage, owner_id, image_input, field, c
             raise ValueError("Image storage returned an invalid handle")
     except Exception as exc:
         raise ValidationError("002", field) from exc
-    repository.grant_image(owner_id, image_hash, creation_time)
+    repository.grant_image(owner_id, image_hash, creation_time, image_name)
     return image_hash
 
 
 class AdPublisher:
     def __init__(self, repository, validator=None, image_storage=None, clock=None):
         self.repository = repository
-        self.validator = validator if validator is not None else AdValidator(repository)
         self.image_storage = image_storage if image_storage is not None else image_store
+        self.validator = (validator if validator is not None
+                          else AdValidator(repository, image_storage=self.image_storage))
         self.clock = clock if clock is not None else time.time
 
     def publish(self, data):

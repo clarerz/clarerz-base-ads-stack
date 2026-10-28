@@ -7,6 +7,7 @@ image bytes. Local files are copied and hashed by content.
 import hashlib
 import json
 import os
+import tempfile
 from typing import Dict, List, Optional
 
 import file_store
@@ -37,17 +38,26 @@ def _load_seeded() -> List[Dict]:
 def _load_persisted() -> List[Dict]:
     if not os.path.exists(_PERSIST_FILE):
         return []
-    try:
-        with open(_PERSIST_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    # Propagate read and parse errors: treating a damaged registry as empty would let
+    # the next ingestion overwrite every other image's record.
+    with open(_PERSIST_FILE, "r") as f:
+        return json.load(f)
 
 
 def _save_persisted(images: List[Dict]) -> None:
     # Propagate failures so publishing cannot report a non-durable image as saved.
-    with open(_PERSIST_FILE, "w") as f:
-        json.dump(images, f, indent=2)
+    # Write a synced temporary file and rename it over the registry, so a crash
+    # leaves the old or new registry, never a partial one.
+    tmp = tempfile.NamedTemporaryFile("w", dir=_PERSIST_DIR, suffix=".tmp", delete=False)
+    try:
+        with tmp:
+            json.dump(images, tmp, indent=2)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp.name, _PERSIST_FILE)
+    except BaseException:
+        os.unlink(tmp.name)
+        raise
 
 
 def _hash_for_url(url: str) -> str:

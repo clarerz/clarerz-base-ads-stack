@@ -447,19 +447,37 @@ class AdsStackTests(unittest.TestCase):
                 self.assertIsNone(repository.get_ad(1))
 
     def test_real_image_registry_write_failure_rejected(self):
-        import builtins
-
-        original_open = builtins.open
-        def fail_registry_write(file, mode="r", *args, **kwargs):
-            if str(file) == self.image_store._PERSIST_FILE and "w" in mode:
+        original_replace = os.replace
+        def fail_registry_replace(src, dst):
+            if str(dst) == self.image_store._PERSIST_FILE:
                 raise PermissionError("Registry not writable")
-            return original_open(file, mode, *args, **kwargs)
+            return original_replace(src, dst)
 
-        with patch("builtins.open", side_effect=fail_registry_write):
+        with patch.object(self.image_store.os, "replace", side_effect=fail_registry_replace):
             self.assert_error(self.publish.publish_ad(self.payload(image=NEW_URL)),
                               "002", "image")
         self.assertIsNone(self.publish.get_ad(1))
         self.assertIsNone(self.image_store.get_image_by_url(NEW_URL))
+        self.assertEqual(list(Path(self.image_store._PERSIST_DIR).glob("*.tmp")), [])
+
+    def test_interrupted_registry_write_keeps_previous_registry(self):
+        uploaded = self.image_upload()["hash"]
+        registry = Path(self.image_store._PERSIST_FILE)
+        before = registry.read_bytes()
+
+        def partial_dump(images, f, **kwargs):
+            f.write("[{")  # The process fails midway through writing.
+            raise OSError("Disk full")
+
+        with patch.object(self.image_store.json, "dump", side_effect=partial_dump):
+            self.assert_error(self.publish.publish_ad(self.payload(image=NEW_URL)),
+                              "002", "image")
+        self.assertEqual(registry.read_bytes(), before)
+        self.assertEqual(list(Path(self.image_store._PERSIST_DIR).glob("*.tmp")), [])
+        data = self.payload(image_hash=uploaded)
+        del data["image"]
+        self.publish_ok(data)
+        self.publish_ok(self.payload(image=NEW_URL))
 
     def test_repository_failure_mapping(self):
         repository = Mock()
@@ -469,7 +487,7 @@ class AdsStackTests(unittest.TestCase):
         repository.save_ad.side_effect = OSError("DB unavailable")
         service = self.service.AdsService(repository)
         data = {"creator_id": 1, "access_token": "token", "text": VALID_TEXT,
-                "image_hash": "a" * 32}
+                "image_hash": self.seeded[0]["hash"]}
         with self.assertRaises(OSError):
             service.create_account(2, "Advertiser")
         with self.assertRaises(OSError):
@@ -904,7 +922,7 @@ class AdsStackTests(unittest.TestCase):
             image_hash = "abcdefghij"[i] * 32
             repository.grant_image(owner_id, image_hash, creation_time)
             images.append({"hash": image_hash, "owner_id": owner_id,
-                           "creation_time": creation_time})
+                           "creation_time": creation_time, "image_name": None})
         return images
 
     def list_all_image_pages(self, **kwargs):
@@ -1002,6 +1020,137 @@ class AdsStackTests(unittest.TestCase):
         with patch.object(self.publish, "_service",
                           return_value=self.service.AdsService(repository)):
             self.assert_error(self.publish.list_images(1, self.token), "002", "images")
+
+    def test_publish_rejects_hashes_missing_from_image_store(self):
+        data = self.payload(image_hash="f" * 32)
+        del data["image"]
+        # Owned but never stored: no image to show, so the ad must not publish.
+        self.video_repository().grant_image(1, "f" * 32, 1)
+        self.assert_error(self.publish.publish_ad(data), "002", "image_hash")
+        # An uploaded image that later disappears from storage is rejected too.
+        uploaded = self.image_upload()["hash"]
+        data["image_hash"] = uploaded
+        with patch.object(self.image_store, "get_image_by_hash", return_value=None):
+            self.assert_error(self.publish.publish_ad(data), "002", "image_hash")
+        with patch.object(self.image_store, "get_image_by_hash", side_effect=OSError("down")):
+            self.assert_error(self.publish.publish_ad(data), "002", "image_hash")
+        self.assertIsNone(self.publish.get_ad(1))
+        self.publish_ok(data)
+
+    def test_validator_checks_the_publishers_image_storage(self):
+        repository = self.video_repository()
+        repository.grant_image(1, "f" * 32, 1)
+        storage = Mock()
+        storage.get_image_by_hash.return_value = None
+        publisher = self.publishing.AdPublisher(repository, image_storage=storage)
+        data = self.payload(image_hash="f" * 32)
+        del data["image"]
+        with self.assertRaises(self.validation.ValidationError) as caught:
+            publisher.publish(data)
+        self.assertEqual(caught.exception.field, "image_hash")
+        storage.get_image_by_hash.assert_called_once_with("f" * 32)
+        storage.get_image_by_hash.return_value = {"hash": "f" * 32}
+        self.assertEqual(publisher.publish(data).image_hash, "f" * 32)
+
+    def test_uploaded_hashes_publish_unchanged(self):
+        hashes = []
+        for name, content in (("a.png", b"PNG"), ("b.jpg", b"JPEG"), ("noext", b"RAW"),
+                              ("empty.gif", b"")):
+            with self.subTest(name=name):
+                image_hash = self.image_upload(file=self.video_file(name, content))["hash"]
+                self.assertEqual(image_hash, hashlib.sha256(content).hexdigest()[:32])
+                self.assertEqual(self.image_store.get_image_by_hash(image_hash)["hash"], image_hash)
+                data = self.payload(image_hash=image_hash)
+                del data["image"]
+                ad = self.publish.get_ad(self.publish_ok(data))
+                self.assertEqual(ad["image_hash"], image_hash)
+                hashes.append(image_hash)
+        # Surrounding spaces are trimmed; hashes are otherwise matched exactly.
+        data = self.payload(image_hash=f"  {hashes[0]}  ")
+        del data["image"]
+        self.assertEqual(self.publish.get_ad(self.publish_ok(data))["image_hash"], hashes[0])
+        data["image_hash"] = hashes[0].upper()
+        self.assert_error(self.publish.publish_ad(data), "002", "image_hash")
+        # Hashes from URL ingestion and file ingestion during publish also republish by hash.
+        for image in (NEW_URL, "sample.jpg"):
+            with self.subTest(image=image):
+                ingested = self.publish.get_ad(self.publish_ok(self.payload(image=image)))
+                data = self.payload(image_hash=ingested["image_hash"])
+                del data["image"]
+                self.publish_ok(data)
+        fresh = self.fresh_process(
+            "import json, publish; print(json.dumps(publish.publish_ad({"
+            f"'creator_id': 1, 'access_token': {self.token!r}, 'text': {VALID_TEXT!r}, "
+            f"'image_hash': {hashes[1]!r}" + "})))"
+        )
+        self.assertIn("id", fresh)
+
+    def test_damaged_image_registry_is_not_overwritten(self):
+        uploaded = self.image_upload()["hash"]
+        registry = Path(self.image_store._PERSIST_FILE)
+        for damaged in ("{not json", "{}"):
+            with self.subTest(damaged=damaged):
+                registry.write_text(damaged)
+                self.assert_error(self.image_upload(file=self.video_file("new.png", b"NEW")),
+                                  "002", "file")
+                self.assert_error(self.publish.publish_ad(self.payload(image=NEW_URL)),
+                                  "002", "image")
+                data = self.payload(image_hash=uploaded)
+                del data["image"]
+                self.assert_error(self.publish.publish_ad(data), "002", "image_hash")
+                self.assertEqual(registry.read_text(), damaged)
+        self.assertIsNone(self.publish.get_ad(1))
+
+    def listed_images(self, owner_id=1, token=None):
+        page = self.publish.list_images(owner_id, token or self.token)
+        return {image["hash"]: image for image in page["data"]}
+
+    def test_upload_image_sets_optional_name(self):
+        named = self.image_upload(image_name="  Spring hero  ")["hash"]
+        unnamed = self.image_upload(file=self.video_file("plain.png", b"PLAIN"))["hash"]
+        ingested = self.publish.get_ad(self.publish_ok())["image_hash"]
+        images = self.listed_images()
+        self.assertEqual(images[named]["image_name"], "Spring hero")
+        self.assertIsNone(images[unnamed]["image_name"])
+        self.assertIsNone(images[ingested]["image_name"])
+        self.assertEqual(set(images[named]), {"hash", "owner_id", "creation_time", "image_name"})
+        fresh = self.fresh_process(
+            f"import json, publish; print(json.dumps(publish.list_images(1, {self.token!r})))")
+        self.assertIn(images[named], fresh["data"])
+
+    def test_reupload_updates_name_and_keeps_creation_time(self):
+        image_hash = self.image_upload(image_name="First")["hash"]
+        created = self.listed_images()[image_hash]["creation_time"]
+        with patch.object(self.service.time, "time", return_value=created + 1000):
+            self.image_upload(image_name="Second")
+            self.assertEqual(self.listed_images()[image_hash],
+                             {"hash": image_hash, "owner_id": 1, "creation_time": created,
+                              "image_name": "Second"})
+            # Without a name, a re-upload or a publish ingestion keeps the current one.
+            self.image_upload()
+            self.publish_ok(self.payload(image=self.video_file("photo.png", b"PNG_BYTES")))
+        self.assertEqual(self.listed_images()[image_hash]["image_name"], "Second")
+
+    def test_image_names_are_per_account(self):
+        other_token = self.create_account(2, "Advertiser Two")
+        image_hash = self.image_upload(image_name="Ours")["hash"]
+        self.assertEqual(self.image_upload(owner_id=2, access_token=other_token,
+                                           image_name="Theirs"), {"hash": image_hash})
+        self.assertEqual(self.listed_images()[image_hash]["image_name"], "Ours")
+        self.assertEqual(self.listed_images(2, other_token)[image_hash]["image_name"], "Theirs")
+
+    def test_upload_image_rejects_invalid_names(self):
+        image_hash = self.image_upload(image_name="Original")["hash"]
+        for name in ("", "   ", None, 123, ["Name"]):
+            with self.subTest(name=name):
+                self.assert_error(self.image_upload(image_name=name), "002", "image_name")
+                self.assert_error(self.image_upload(file=self.video_file("other.png", b"OTHER"),
+                                                    image_name=name), "002", "image_name")
+        self.assertEqual(list(self.listed_images()), [image_hash])
+        self.assertEqual(self.listed_images()[image_hash]["image_name"], "Original")
+        # Videos keep their own name field and do not accept image_name.
+        self.assert_error(self.publish.upload_video(self.video_payload(image_name="x")),
+                          "001", "image_name")
 
 if __name__ == "__main__":
     unittest.main()

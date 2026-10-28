@@ -7,7 +7,7 @@ import image_store
 from publishing import AdPublisher, store_owned_image
 from validation import (AccountValidator, UploadValidator, ValidationError, VideoValidator,
                         authenticate, coerce_id, encode_image_cursor, encode_video_cursor,
-                        hash_token, validate_video_name)
+                        hash_token, validate_name)
 import video_store
 
 
@@ -58,9 +58,9 @@ class AdsService:
 
     def upload_image(self, data):
         """Store an image for its authenticated owner and return the image's content hash."""
-        owner_id, path = self.image_validator.validate(data)
+        owner_id, path, image_name = self.image_validator.validate(data)
         return store_owned_image(self.repository, self.image_storage, owner_id, path, "file",
-                                 int(time.time()))
+                                 int(time.time()), image_name)
 
     def list_images(self, owner_id, access_token, limit=None, cursor=None, since=None,
                     until=None):
@@ -87,7 +87,7 @@ class AdsService:
         video_id = coerce_id(video_id)
         if video_id is None:
             raise ValidationError("002", "video_id")
-        name = validate_video_name(name)
+        name = validate_name(name)
         video = self.repository.get_video(video_id)
         if video is None:
             raise ValidationError("002", "video_id")

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 
+import image_store
 from models import AdAccount, AdDraft
 
 URL_REGEX = re.compile(r"^https?://[^\s]+$")
@@ -72,9 +73,11 @@ class AdValidator:
     allowed_fields = frozenset({"creator_id", "access_token", "text", "image", "image_hash",
                                 "video_id"})
 
-    def __init__(self, repository, base_dir=None, rules=()):
+    def __init__(self, repository, base_dir=None, rules=(), image_storage=None):
         self.repository = repository
         self.base_dir = Path(base_dir or Path(__file__).resolve().parent)
+        # Must be the storage the publisher ingests into, so stored hashes resolve.
+        self.image_storage = image_storage if image_storage is not None else image_store
         # Extra rules accept an AdDraft and raise ValidationError on rejection.
         self.rules = tuple(rules)
 
@@ -147,16 +150,19 @@ class AdValidator:
         raise ValidationError("002", "image")
 
     def validate_hash(self, value, creator_id):
-        # Only images the creator uploaded or ingested may be used.
+        # The hash must name an image in storage that the creator uploaded or ingested.
+        # Missing, unowned, and unresolvable hashes get the same error.
         if not isinstance(value, str) or not HASH_REGEX.match(value.strip()):
             raise ValidationError("002", "image_hash")
+        value = value.strip()
         try:
-            owned = self.repository.owns_image(creator_id, value.strip())
+            valid = (self.repository.owns_image(creator_id, value)
+                     and self.image_storage.get_image_by_hash(value) is not None)
         except Exception as exc:
             raise ValidationError("002", "image_hash") from exc
-        if not owned:
+        if not valid:
             raise ValidationError("002", "image_hash")
-        return value.strip()
+        return value
 
     def validate_video(self, value, creator_id):
         # The creator must own the video. Missing and unowned videos get the same
@@ -173,9 +179,9 @@ class AdValidator:
         return video_id
 
 
-def validate_video_name(value):
+def validate_name(value, field="name"):
     if not isinstance(value, str) or not value.strip():
-        raise ValidationError("002", "name")
+        raise ValidationError("002", field)
     return value.strip()
 
 
@@ -183,21 +189,24 @@ class UploadValidator:
     """Image uploads and listings; videos extend it. Uploads authenticate the owner first."""
 
     required_fields = ("owner_id", "access_token", "file")
+    optional_fields = ("image_name",)
 
     def __init__(self, repository):
         self.repository = repository
 
     def validate(self, data):
-        """Return (owner_id, absolute file path) for a valid upload request."""
+        """Return (owner_id, absolute file path, image name or None) for an image upload."""
         owner_id = self.validate_request(data)
-        return owner_id, self.validate_file(data["file"])
+        image_name = (validate_name(data["image_name"], "image_name")
+                      if "image_name" in data else None)
+        return owner_id, self.validate_file(data["file"]), image_name
 
     def validate_request(self, data):
         """Check field names, then return the authenticated owner ID."""
         if not isinstance(data, dict):
             raise ValidationError("002", "data")
         for field in data:
-            if field not in self.required_fields:
+            if field not in self.required_fields + self.optional_fields:
                 raise ValidationError("001", field)
         for field in self.required_fields:
             if field not in data:
@@ -245,11 +254,12 @@ class UploadValidator:
 
 class VideoValidator(UploadValidator):
     required_fields = ("owner_id", "access_token", "name", "file")
+    optional_fields = ()
 
     def validate(self, data):
         """Return (owner_id, name, absolute file path) for a valid upload request."""
         owner_id = self.validate_request(data)
-        return owner_id, validate_video_name(data["name"]), self.validate_file(data["file"])
+        return owner_id, validate_name(data["name"]), self.validate_file(data["file"])
 
     def validate_file(self, value):
         # The extension is the only video format check.

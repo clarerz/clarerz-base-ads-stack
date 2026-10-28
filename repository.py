@@ -14,7 +14,8 @@ class AdsRepository(Protocol):
     def get_account(self, account_id: int) -> Optional[AdAccount]: ...
     def get_token_hash(self, account_id: int) -> Optional[str]: ...
     def set_token_hash(self, account_id: int, token_hash: str) -> bool: ...
-    def grant_image(self, owner_id: int, image_hash: str, creation_time: int) -> None: ...
+    def grant_image(self, owner_id: int, image_hash: str, creation_time: int,
+                    image_name: Optional[str] = None) -> None: ...
     def owns_image(self, owner_id: int, image_hash: str) -> bool: ...
     def list_images(self, owner_id: int, limit: int, after: Optional[tuple] = None,
                     since: Optional[int] = None, until: Optional[int] = None) -> list: ...
@@ -52,7 +53,7 @@ class SQLiteAdsRepository:
                          "ON videos (owner_id, upload_time)")
             # Identical image bytes share one hash; each account that ingested them owns it.
             conn.execute("CREATE TABLE IF NOT EXISTS image_owners (owner_id INTEGER, "
-                         "image_hash TEXT, creation_time INTEGER, "
+                         "image_hash TEXT, creation_time INTEGER, image_name TEXT, "
                          "PRIMARY KEY (owner_id, image_hash))")
             conn.execute("CREATE INDEX IF NOT EXISTS image_owners_by_owner_time "
                          "ON image_owners (owner_id, creation_time)")
@@ -104,11 +105,15 @@ class SQLiteAdsRepository:
                                   (token_hash, account_id))
         return cursor.rowcount == 1
 
-    def grant_image(self, owner_id, image_hash, creation_time):
-        # Re-ingesting an owned image keeps its original creation time.
+    def grant_image(self, owner_id, image_hash, creation_time, image_name=None):
+        # Re-ingesting an owned image keeps its creation time; a new name replaces the old.
         with closing(self._connect()) as conn, conn:
-            conn.execute("INSERT OR IGNORE INTO image_owners (owner_id, image_hash, creation_time) "
-                         "VALUES (?, ?, ?)", (owner_id, image_hash, creation_time))
+            conn.execute(
+                "INSERT INTO image_owners (owner_id, image_hash, creation_time, image_name) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (owner_id, image_hash) DO UPDATE SET "
+                "image_name = COALESCE(excluded.image_name, image_name)",
+                (owner_id, image_hash, creation_time, image_name),
+            )
 
     def owns_image(self, owner_id, image_hash):
         with closing(self._connect()) as conn:
@@ -165,7 +170,8 @@ class SQLiteAdsRepository:
 
     def list_images(self, owner_id, limit, after=None, since=None, until=None):
         """Newest first; `after` is the (creation_time, hash) of the previous page's last image."""
-        rows = self._list_page("SELECT image_hash, owner_id, creation_time FROM image_owners",
+        rows = self._list_page("SELECT image_hash, owner_id, creation_time, image_name "
+                               "FROM image_owners",
                                "creation_time", "image_hash", owner_id, limit, after, since, until)
         return [Image(*row) for row in rows]
 

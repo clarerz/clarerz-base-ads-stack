@@ -47,6 +47,7 @@ class Image:
     hash: str
     owner_id: int
     creation_time: int
+    image_name: Optional[str] = None
 
     def to_dict(self):
         return asdict(self)

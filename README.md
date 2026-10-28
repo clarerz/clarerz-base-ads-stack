@@ -33,7 +33,7 @@ PY
 | `create_account(account_id, name, access_token)` | Rename an existing account. Returns `{"id": ...}` or an error. |
 | `get_account(account_id)` | Return `id` and `name`, or `None` if missing/invalid. |
 | `publish_ad(data)` | Require an existing `creator_id`, its `access_token`, one `text` field, and either `image`/`image_hash` (image ad) or `video_id` (video ad). Return a numeric ad ID or an error. |
-| `upload_image(data)` | Require an existing `owner_id`, its `access_token`, and a local image `file` path. Return `{"hash": ...}` or an error. |
+| `upload_image(data)` | Require an existing `owner_id`, its `access_token`, and a local image `file` path; `image_name` is optional. Return `{"hash": ...}` or an error. |
 | `list_images(owner_id, access_token, limit=None, cursor=None, since=None, until=None)` | Return one page of the images the account owns, newest first: `{"data": [...], "next_cursor": ...}`. |
 | `get_ads(ad_id, fields=None)` | Return the stored ad or requested fields; unknown fields return an error. |
 | `get_ad(ad_id)` | Return the full stored ad, or `None` if missing/invalid. |
@@ -73,7 +73,10 @@ account has to upload them itself to own them.
 
 `image` accepts an HTTP(S) URL, a local path, or a filename from
 `file_handle_store/`. `image_hash` must be a 16–64 character alphanumeric handle
-owned by `creator_id`; otherwise it returns `002`. If both image fields are
+that `creator_id` owns and that the image store can resolve; otherwise it returns
+`002`. Missing, unowned, and unresolvable hashes are indistinguishable. Hashes
+returned by `upload_image` publish unchanged; surrounding spaces are trimmed, but
+case and every other character must match. If both image fields are
 supplied, both are checked and the ingested image's hash is used.
 
 Image files are limited to 30 MiB (Meta's ad image maximum) and videos to 1 GiB.
@@ -92,8 +95,13 @@ fixed at upload. `file` must be an existing local file ending in `.mp4`, `.mov`,
 `.m4v`, `.webm`, `.mkv`, or `.avi`; the extension is the only format check. Video
 errors use `owner_id`, `name`, `file`, or `video_id` as the field.
 
-An owned image contains `hash`, `owner_id`, and `creation_time`: when that account
-first uploaded or ingested it (Unix seconds). Re-uploading keeps the original time.
+An owned image contains `hash`, `owner_id`, `creation_time`, and `image_name`.
+`creation_time` is when that account first uploaded or ingested it (Unix seconds);
+re-uploading keeps the original time. `image_name` is the account's own label, or
+`None`: it is trimmed and must not be blank, otherwise upload returns `002` for
+`image_name`. Re-uploading with a name replaces the account's name; without one,
+the name is kept. Images ingested by `publish_ad` have no name. Accounts that
+upload the same bytes share the hash but keep separate names.
 
 `list_videos` and `list_images` page by cursor. Pass the previous response's `next_cursor` to get
 the next page; it is `None` on the last page. Treat cursors as opaque. Pages
@@ -160,7 +168,7 @@ def limit_text_length(draft):
     if len(draft.text) > 120:
         raise ValidationError("002", "text")
 
-validator = AdValidator(repository, rules=[limit_text_length])
+validator = AdValidator(repository, rules=[limit_text_length])  # image_storage=... if custom
 publisher = AdPublisher(repository, validator=validator)
 service = AdsService(repository, publisher=publisher)
 ```
@@ -170,8 +178,10 @@ For different field policies, subclass `AdValidator` and override its
 or supply a validator with a `validate(data) -> AdDraft` method. Account and
 projection validators are separate classes as well.
 
-`AdPublisher` accepts an `image_storage` object with `store_image(input)` and a
-`clock` callable. Subclass it to customize `normalize_image(draft)` or
+`AdPublisher` accepts an `image_storage` object with `store_image(input)` and
+`get_image_by_hash(hash)`, and a `clock` callable. Its default validator checks
+hashes against that same storage; pass the same `image_storage` to a custom
+`AdValidator`. Subclass it to customize `normalize_image(draft)` or
 `persist(draft)`, or supply another publisher with `publish(data) -> Ad` to
 `AdsService`. A different repository must implement the `AdsRepository` protocol in
 `repository.py` using the same domain objects.
@@ -199,7 +209,11 @@ three example image records; it is separate from generated data.
 
 `image_store.py` is a simulated image registry. URLs are recorded as metadata
 with a hash derived from the URL; image bytes are **not downloaded**. Local files
-are copied into storage and hashed by their contents. The supplied `sample.jpg`
+are copied into storage and hashed by their contents. If `persisted_images.json`
+cannot be read or parsed, lookups and ingestion fail with `002` instead of treating
+the registry as empty, so a damaged registry is never overwritten. Registry
+writes go to a synced temporary file that replaces the registry in one rename, so
+an interrupted write leaves the previous registry intact. The supplied `sample.jpg`
 is a text placeholder, not a decodable JPEG. File ingestion does not validate
 image formats.
 
@@ -217,7 +231,7 @@ They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The suite has 77 tests, including boundary cases, storage failures, rollback, and
+The suite has 86 tests, including boundary cases, storage failures, rollback, and
 concurrent SQLite ad ID allocation, token and ownership enforcement, size limits, and image listing. See [VERIFICATION.md](VERIFICATION.md) for
 the test audit, deliberate regression checks, bugs fixed, and remaining limits.
 
