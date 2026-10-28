@@ -90,10 +90,15 @@ class AdsStackTests(unittest.TestCase):
         self.assertIsInstance(ad_id, int)
         self.assertNotIsInstance(ad_id, bool)
 
-    def test_both_url_and_file_image_supported(self):
-        for image in (self.seeded[0]["url"], "sample.jpg"):
+    def test_image_field_accepts_links_only(self):
+        self.publish_ok(self.payload(image=self.seeded[0]["url"]))
+        # Local files are uploaded first, then published by hash or name.
+        sample = str(BASE_DIR / "file_handle_store/sample.jpg")
+        for image in ("sample.jpg", sample, f"file://{sample}", "ftp://cdn.example.com/a.jpg"):
             with self.subTest(image=image):
-                self.publish_ok(self.payload(image=image))
+                self.assert_error(self.publish.publish_ad(self.payload(image=image)),
+                                  "002", "image")
+        self.assertEqual(self.stored_image_files(), [])
 
     def test_create_account_and_reference(self):
         token = self.create_account(2, "Advertiser Two")
@@ -205,10 +210,13 @@ class AdsStackTests(unittest.TestCase):
         # URL ingestion is metadata-only in the inherited image registry.
         self.assertNotIn("path", stored)
 
-    def test_file_handle_resolves_to_hash(self):
+    def test_uploaded_file_resolves_to_hash(self):
         sample = BASE_DIR / "file_handle_store/sample.jpg"
         expected = hashlib.sha256(sample.read_bytes()).hexdigest()[:32]
-        ad_id = self.publish_ok(self.payload(image="sample.jpg"))
+        self.assertEqual(self.image_upload(file=str(sample)), {"hash": expected})
+        data = self.payload(image_hash=expected)
+        del data["image"]
+        ad_id = self.publish_ok(data)
         self.assertEqual(self.publish.get_ads(ad_id)["image_hash"], expected)
         image = self.fresh_process(
             f"import json, image_store; print(json.dumps(image_store.get_image_by_hash({expected!r})))"
@@ -270,13 +278,24 @@ class AdsStackTests(unittest.TestCase):
         storage.store_image.assert_not_called()
         self.assertIsNone(repository.get_ad(1))
 
-    def test_invalid_hash_does_not_ingest_image(self):
+    def test_more_than_one_image_field_rejected_before_ingestion(self):
         repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        image_hash = self.image_upload(image_name="Hero")["hash"]
         storage = Mock()
         publisher = self.publishing.AdPublisher(repository, image_storage=storage)
-        with self.assertRaises(self.validation.ValidationError) as caught:
-            publisher.publish(self.payload(image=NEW_URL, image_hash="bad"))
-        self.assertEqual(caught.exception.field, "image_hash")
+        valid = {"image": NEW_URL, "image_hash": image_hash, "image_name": "Hero"}
+        # The error names the second field supplied, in link, hash, name order.
+        for fields, field in ((("image", "image_hash"), "image_hash"),
+                              (("image", "image_name"), "image_name"),
+                              (("image_hash", "image_name"), "image_name"),
+                              (("image", "image_hash", "image_name"), "image_hash")):
+            with self.subTest(fields=fields):
+                data = self.payload(**{name: valid[name] for name in fields})
+                if "image" not in fields:
+                    del data["image"]
+                with self.assertRaises(self.validation.ValidationError) as caught:
+                    publisher.publish(data)
+                self.assertEqual(caught.exception.field, field)
         storage.store_image.assert_not_called()
         self.assertIsNone(repository.get_ad(1))
 
@@ -287,9 +306,7 @@ class AdsStackTests(unittest.TestCase):
         publisher = self.publishing.AdPublisher(repository, image_storage=storage,
                                                clock=lambda: 1234567890)
         service = self.object_service(publisher=publisher)
-        repository.grant_image(1, "a" * 32, 1)
-        # Image ingestion retains precedence over a supplied valid, owned hash.
-        ad = service.publish_ad(self.payload(image=NEW_URL, image_hash="a" * 32))
+        ad = service.publish_ad(self.payload(image=NEW_URL))
         self.assertEqual(ad.image_hash, "f" * 32)
         self.assertEqual(ad.creation_time, 1234567890)
         self.assertEqual(service.get_ad(ad.id), ad)
@@ -527,14 +544,12 @@ class AdsStackTests(unittest.TestCase):
             self.assertEqual(repository.get_ad(ad.id), ad)
 
     def test_file_and_url_ingestion_deduplicate(self):
-        for image in (NEW_URL, "sample.jpg"):
-            with self.subTest(image=image):
-                ids = [self.publish_ok(self.payload(image=image)) for _ in range(2)]
-                ads = [self.publish.get_ad(ad_id) for ad_id in ids]
-                self.assertEqual(ads[0]["image_hash"], ads[1]["image_hash"])
-                matches = [entry for entry in self.image_store.list_images()
-                           if entry["hash"] == ads[0]["image_hash"]]
-                self.assertEqual(len(matches), 1)
+        ids = [self.publish_ok(self.payload(image=NEW_URL)) for _ in range(2)]
+        ads = [self.publish.get_ad(ad_id) for ad_id in ids]
+        self.assertEqual(ads[0]["image_hash"], ads[1]["image_hash"])
+        matches = [entry for entry in self.image_store.list_images()
+                   if entry["hash"] == ads[0]["image_hash"]]
+        self.assertEqual(len(matches), 1)
 
     def video_file(self, name="clip.mp4", content=b"FAKE_VIDEO_BYTES"):
         path = self.data_dir / "uploads" / name
@@ -1071,13 +1086,11 @@ class AdsStackTests(unittest.TestCase):
         self.assertEqual(self.publish.get_ad(self.publish_ok(data))["image_hash"], hashes[0])
         data["image_hash"] = hashes[0].upper()
         self.assert_error(self.publish.publish_ad(data), "002", "image_hash")
-        # Hashes from URL ingestion and file ingestion during publish also republish by hash.
-        for image in (NEW_URL, "sample.jpg"):
-            with self.subTest(image=image):
-                ingested = self.publish.get_ad(self.publish_ok(self.payload(image=image)))
-                data = self.payload(image_hash=ingested["image_hash"])
-                del data["image"]
-                self.publish_ok(data)
+        # Hashes from link ingestion during publish also republish by hash.
+        ingested = self.publish.get_ad(self.publish_ok(self.payload(image=NEW_URL)))
+        data = self.payload(image_hash=ingested["image_hash"])
+        del data["image"]
+        self.publish_ok(data)
         fresh = self.fresh_process(
             "import json, publish; print(json.dumps(publish.publish_ad({"
             f"'creator_id': 1, 'access_token': {self.token!r}, 'text': {VALID_TEXT!r}, "
@@ -1126,9 +1139,8 @@ class AdsStackTests(unittest.TestCase):
             self.assertEqual(self.listed_images()[image_hash],
                              {"hash": image_hash, "owner_id": 1, "creation_time": created,
                               "image_name": "Second"})
-            # Without a name, a re-upload or a publish ingestion keeps the current one.
+            # Without a name, a re-upload keeps the current one.
             self.image_upload()
-            self.publish_ok(self.payload(image=self.video_file("photo.png", b"PNG_BYTES")))
         self.assertEqual(self.listed_images()[image_hash]["image_name"], "Second")
 
     def test_image_names_are_per_account(self):
@@ -1151,6 +1163,78 @@ class AdsStackTests(unittest.TestCase):
         # Videos keep their own name field and do not accept image_name.
         self.assert_error(self.publish.upload_video(self.video_payload(image_name="x")),
                           "001", "image_name")
+
+    def name_payload(self, name, **changes):
+        data = self.payload(image_name=name, **changes)
+        del data["image"]
+        return data
+
+    def test_publish_by_image_name(self):
+        image_hash = self.image_upload(image_name="Spring hero")["hash"]
+        ad_id = self.publish_ok(self.name_payload("  Spring hero  "))
+        self.assertEqual(self.publish.get_ad(ad_id)["image_hash"], image_hash)
+        fresh = self.fresh_process(
+            "import json, publish; print(json.dumps(publish.publish_ad({"
+            f"'creator_id': 1, 'access_token': {self.token!r}, 'text': {VALID_TEXT!r}, "
+            "'image_name': 'Spring hero'})))")
+        self.assertEqual(self.publish.get_ad(fresh["id"])["image_hash"], image_hash)
+
+    def test_publish_by_image_name_rejects_unusable_names(self):
+        self.image_upload(image_name="Spring hero")
+        other_token = self.create_account(2, "Advertiser Two")
+        self.image_upload(owner_id=2, access_token=other_token,
+                          file=self.video_file("theirs.png", b"THEIRS"), image_name="Theirs")
+        # Unknown, another account's, and differently cased names look the same.
+        for name in ("Unknown", "Theirs", "spring hero", "", "   ", None, 123):
+            with self.subTest(name=name):
+                self.assert_error(self.publish.publish_ad(self.name_payload(name)),
+                                  "002", "image_name")
+        # A named image whose stored copy is gone cannot be published.
+        with patch.object(self.image_store, "get_image_by_hash", return_value=None):
+            self.assert_error(self.publish.publish_ad(self.name_payload("Spring hero")),
+                              "002", "image_name")
+        # Authentication comes first, so names reveal nothing without the token.
+        self.assert_error(self.publish.publish_ad(self.name_payload("Spring hero",
+                                                                    access_token="wrong")),
+                          "002", "access_token")
+        self.assert_error(self.publish.publish_ad(self.name_payload("Spring hero",
+                                                                    video_id=1)),
+                          "002", "video_id")
+        self.assertIsNone(self.publish.get_ad(1))
+
+    def test_image_name_lookup_failure_rejects_publish(self):
+        repository = Mock()
+        repository.get_account.return_value = self.models.AdAccount(1, "Advertiser")
+        repository.get_token_hash.return_value = self.validation.hash_token(self.token)
+        repository.get_image_hash_by_name.side_effect = OSError("DB unavailable")
+        with self.assertRaises(self.validation.ValidationError) as caught:
+            self.service.AdsService(repository).publish_ad(self.name_payload("Spring hero"))
+        self.assertEqual(caught.exception.field, "image_name")
+        repository.save_ad.assert_not_called()
+
+    def test_image_names_unique_per_account(self):
+        first = self.image_upload(image_name="Hero")["hash"]
+        second_file = self.video_file("second.png", b"SECOND")
+        self.assert_error(self.image_upload(file=second_file, image_name=" Hero "),
+                          "002", "image_name")
+        self.assertEqual(list(self.listed_images()), [first])
+        # Re-uploading the same image under its own name is fine.
+        self.assertEqual(self.image_upload(image_name="Hero"), {"hash": first})
+        # Another account may use the same name.
+        other_token = self.create_account(2, "Advertiser Two")
+        self.image_upload(owner_id=2, access_token=other_token, file=second_file,
+                          image_name="Hero")
+        # Renaming the first image frees its old name.
+        self.image_upload(image_name="Old hero")
+        second = self.image_upload(file=second_file, image_name="Hero")["hash"]
+        names = {image_hash: image["image_name"] for image_hash, image in self.listed_images().items()}
+        self.assertEqual(names, {first: "Old hero", second: "Hero"})
+        self.assertEqual(self.publish.get_ad(self.publish_ok(self.name_payload("Hero")))["image_hash"],
+                         second)
+        # Unnamed images are exempt from uniqueness.
+        self.image_upload(file=self.video_file("u1.png", b"U1"))
+        self.image_upload(file=self.video_file("u2.png", b"U2"))
+        self.assertEqual(len(self.listed_images()), 4)
 
 if __name__ == "__main__":
     unittest.main()

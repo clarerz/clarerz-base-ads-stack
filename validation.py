@@ -2,7 +2,6 @@
 
 import hashlib
 import hmac
-import os
 from pathlib import Path
 import re
 
@@ -70,12 +69,12 @@ class AccountValidator:
 
 
 class AdValidator:
-    allowed_fields = frozenset({"creator_id", "access_token", "text", "image", "image_hash",
-                                "video_id"})
+    # An image ad names its image exactly one way: by link, hash, or the account's name.
+    image_fields = ("image", "image_hash", "image_name")
+    allowed_fields = frozenset({"creator_id", "access_token", "text", "video_id", *image_fields})
 
-    def __init__(self, repository, base_dir=None, rules=(), image_storage=None):
+    def __init__(self, repository, rules=(), image_storage=None):
         self.repository = repository
-        self.base_dir = Path(base_dir or Path(__file__).resolve().parent)
         # Must be the storage the publisher ingests into, so stored hashes resolve.
         self.image_storage = image_storage if image_storage is not None else image_store
         # Extra rules accept an AdDraft and raise ValidationError on rejection.
@@ -89,12 +88,14 @@ class AdValidator:
                 raise ValidationError("001", field)
         if "text" not in data:
             raise ValidationError("002", "text")
-        has_image = "image" in data or "image_hash" in data
-        if not has_image and "video_id" not in data:
+        image_fields = [field for field in self.image_fields if field in data]
+        if not image_fields and "video_id" not in data:
             raise ValidationError("002", "image")
-        if has_image and "video_id" in data:
+        if image_fields and "video_id" in data:
             # An ad is either an image ad or a video ad.
             raise ValidationError("002", "video_id")
+        if len(image_fields) > 1:
+            raise ValidationError("002", image_fields[1])
         if "creator_id" not in data:
             raise ValidationError("002", "creator_id")
         creator_id = self.validate_creator(data["creator_id"])
@@ -102,8 +103,11 @@ class AdValidator:
         authenticate(self.repository, creator_id, data.get("access_token"))
         text = self.validate_text(data["text"])
         image = self.validate_image(data["image"]) if "image" in data else None
-        image_hash = (self.validate_hash(data["image_hash"], creator_id)
-                      if "image_hash" in data else None)
+        image_hash = None
+        if "image_hash" in data:
+            image_hash = self.validate_hash(data["image_hash"], creator_id)
+        elif "image_name" in data:
+            image_hash = self.validate_image_name(data["image_name"], creator_id)
         video_id = (self.validate_video(data["video_id"], creator_id)
                     if "video_id" in data else None)
         draft = AdDraft(creator_id, text, image, image_hash, video_id)
@@ -132,37 +136,38 @@ class AdValidator:
         return value
 
     def validate_image(self, value):
-        if not isinstance(value, str) or not value.strip():
+        # Links only; local files enter through image upload and publish by hash or name.
+        if not isinstance(value, str) or not URL_REGEX.match(value.strip()):
             raise ValidationError("002", "image")
-        value = value.strip()
-        if value.startswith(("http://", "https://")):
-            if not URL_REGEX.match(value):
-                raise ValidationError("002", "image")
-            return value
-        candidates = (
-            Path(value), self.base_dir / value,
-            self.base_dir / "file_handle_store" / value,
-            self.base_dir / "file_handle_store" / os.path.basename(value),
-        )
-        for candidate in candidates:
-            if candidate.is_file():
-                return str(candidate.resolve())
-        raise ValidationError("002", "image")
+        return value.strip()
 
     def validate_hash(self, value, creator_id):
-        # The hash must name an image in storage that the creator uploaded or ingested.
-        # Missing, unowned, and unresolvable hashes get the same error.
         if not isinstance(value, str) or not HASH_REGEX.match(value.strip()):
             raise ValidationError("002", "image_hash")
-        value = value.strip()
+        return self.check_owned_image(creator_id, value.strip(), "image_hash")
+
+    def validate_image_name(self, value, creator_id):
+        """Return the hash of the creator's image with this name."""
+        name = validate_name(value, "image_name")
         try:
-            valid = (self.repository.owns_image(creator_id, value)
-                     and self.image_storage.get_image_by_hash(value) is not None)
+            image_hash = self.repository.get_image_hash_by_name(creator_id, name)
         except Exception as exc:
-            raise ValidationError("002", "image_hash") from exc
+            raise ValidationError("002", "image_name") from exc
+        if image_hash is None:
+            raise ValidationError("002", "image_name")
+        return self.check_owned_image(creator_id, image_hash, "image_name")
+
+    def check_owned_image(self, creator_id, image_hash, field):
+        # The hash must name an image in storage that the creator uploaded or ingested.
+        # Missing, unowned, and unresolvable images get the same error.
+        try:
+            valid = (self.repository.owns_image(creator_id, image_hash)
+                     and self.image_storage.get_image_by_hash(image_hash) is not None)
+        except Exception as exc:
+            raise ValidationError("002", field) from exc
         if not valid:
-            raise ValidationError("002", "image_hash")
-        return value
+            raise ValidationError("002", field)
+        return image_hash
 
     def validate_video(self, value, creator_id):
         # The creator must own the video. Missing and unowned videos get the same

@@ -15,8 +15,9 @@ class AdsRepository(Protocol):
     def get_token_hash(self, account_id: int) -> Optional[str]: ...
     def set_token_hash(self, account_id: int, token_hash: str) -> bool: ...
     def grant_image(self, owner_id: int, image_hash: str, creation_time: int,
-                    image_name: Optional[str] = None) -> None: ...
+                    image_name: Optional[str] = None) -> bool: ...
     def owns_image(self, owner_id: int, image_hash: str) -> bool: ...
+    def get_image_hash_by_name(self, owner_id: int, image_name: str) -> Optional[str]: ...
     def list_images(self, owner_id: int, limit: int, after: Optional[tuple] = None,
                     since: Optional[int] = None, until: Optional[int] = None) -> list: ...
     def save_ad(self, draft: AdDraft, creation_time: int) -> Ad: ...
@@ -57,6 +58,9 @@ class SQLiteAdsRepository:
                          "PRIMARY KEY (owner_id, image_hash))")
             conn.execute("CREATE INDEX IF NOT EXISTS image_owners_by_owner_time "
                          "ON image_owners (owner_id, creation_time)")
+            # Names identify images within an account; unnamed images (NULL) are exempt.
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS image_owners_by_name "
+                         "ON image_owners (owner_id, image_name)")
         except Exception:
             conn.close()
             raise
@@ -106,14 +110,28 @@ class SQLiteAdsRepository:
         return cursor.rowcount == 1
 
     def grant_image(self, owner_id, image_hash, creation_time, image_name=None):
+        """Return False, changing nothing, if another of the owner's images has the name."""
         # Re-ingesting an owned image keeps its creation time; a new name replaces the old.
-        with closing(self._connect()) as conn, conn:
-            conn.execute(
-                "INSERT INTO image_owners (owner_id, image_hash, creation_time, image_name) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT (owner_id, image_hash) DO UPDATE SET "
-                "image_name = COALESCE(excluded.image_name, image_name)",
-                (owner_id, image_hash, creation_time, image_name),
-            )
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute(
+                    "INSERT INTO image_owners (owner_id, image_hash, creation_time, image_name) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT (owner_id, image_hash) DO UPDATE SET "
+                    "image_name = COALESCE(excluded.image_name, image_name)",
+                    (owner_id, image_hash, creation_time, image_name),
+                )
+        except sqlite3.IntegrityError as exc:
+            if "image_name" not in str(exc):
+                raise
+            return False
+        return True
+
+    def get_image_hash_by_name(self, owner_id, image_name):
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT image_hash FROM image_owners "
+                               "WHERE owner_id = ? AND image_name = ?",
+                               (owner_id, image_name)).fetchone()
+        return row[0] if row is not None else None
 
     def owns_image(self, owner_id, image_hash):
         with closing(self._connect()) as conn:

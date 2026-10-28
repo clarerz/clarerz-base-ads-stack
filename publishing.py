@@ -22,7 +22,10 @@ def store_owned_image(repository, image_storage, owner_id, image_input, field, c
             raise ValueError("Image storage returned an invalid handle")
     except Exception as exc:
         raise ValidationError("002", field) from exc
-    repository.grant_image(owner_id, image_hash, creation_time, image_name)
+    # ponytail: a name conflict is only detected after the bytes are stored, so they stay
+    # stored but unowned; check the name first if orphaned files matter.
+    if not repository.grant_image(owner_id, image_hash, creation_time, image_name):
+        raise ValidationError("002", "image_name")
     return image_hash
 
 

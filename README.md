@@ -32,7 +32,7 @@ PY
 | `create_account(account_id, name)` | Create an account. Returns `{"id": ..., "access_token": ...}`, or `002` for `account_id` if the ID is taken. |
 | `create_account(account_id, name, access_token)` | Rename an existing account. Returns `{"id": ...}` or an error. |
 | `get_account(account_id)` | Return `id` and `name`, or `None` if missing/invalid. |
-| `publish_ad(data)` | Require an existing `creator_id`, its `access_token`, one `text` field, and either `image`/`image_hash` (image ad) or `video_id` (video ad). Return a numeric ad ID or an error. |
+| `publish_ad(data)` | Require an existing `creator_id`, its `access_token`, one `text` field, and exactly one of `image` (link), `image_hash`, or `image_name` (image ad), or `video_id` (video ad). Return a numeric ad ID or an error. |
 | `upload_image(data)` | Require an existing `owner_id`, its `access_token`, and a local image `file` path; `image_name` is optional. Return `{"hash": ...}` or an error. |
 | `list_images(owner_id, access_token, limit=None, cursor=None, since=None, until=None)` | Return one page of the images the account owns, newest first: `{"data": [...], "next_cursor": ...}`. |
 | `get_ads(ad_id, fields=None)` | Return the stored ad or requested fields; unknown fields return an error. |
@@ -67,27 +67,36 @@ not look like a URL or a hash.
 
 An image is identified by the first 32 hex characters of its content's SHA-256
 (URLs: of the URL). Accounts can only publish images they own. An account owns an
-image after uploading it with `upload_image` or after publishing with `image`,
-which ingests it. Identical bytes get the same hash and are stored once, but each
+image after uploading it with `upload_image` or after publishing with an `image`
+link, which ingests it. Identical bytes get the same hash and are stored once, but each
 account has to upload them itself to own them.
 
-`image` accepts an HTTP(S) URL, a local path, or a filename from
-`file_handle_store/`. `image_hash` must be a 16–64 character alphanumeric handle
-that `creator_id` owns and that the image store can resolve; otherwise it returns
-`002`. Missing, unowned, and unresolvable hashes are indistinguishable. Hashes
-returned by `upload_image` publish unchanged; surrounding spaces are trimmed, but
-case and every other character must match. If both image fields are
-supplied, both are checked and the ingested image's hash is used.
+An image ad names its image exactly one way; each field is validated before
+anything is ingested or saved:
+
+- `image`: an HTTP(S) link, ingested as metadata. Local files are not accepted;
+  upload them with `upload_image`, then publish by hash or name.
+- `image_hash`: a 16–64 character alphanumeric handle that `creator_id` owns and
+  that the image store can resolve. Hashes returned by `upload_image` publish
+  unchanged; surrounding spaces are trimmed, but case and every other character
+  must match.
+- `image_name`: the name `creator_id` gave an image at upload, matched exactly
+  after trimming. It resolves to that image's hash, which must also be in the
+  image store.
+
+Invalid values return `002` for that field. Missing, unowned, and unresolvable
+images are indistinguishable, and authentication runs first. Supplying more than
+one image field returns `002` for the second one, in `image`, `image_hash`,
+`image_name` order.
 
 Image files are limited to 30 MiB (Meta's ad image maximum) and videos to 1 GiB.
-Larger files return `002` for `file` (or for `image` when publishing) and leave
-nothing stored. The limit is enforced while copying, not from a size checked
+Larger files return `002` for `file` and leave nothing stored. The limit is enforced while copying, not from a size checked
 in advance.
 
 `video_id` must name a video owned by the ad's `creator_id`. A missing video and
 another account's video both return `002` for `video_id`, so callers cannot tell
-which IDs exist. Combining `video_id` with `image` or `image_hash` also returns
-`002` for `video_id`.
+which IDs exist. Combining `video_id` with any image field also returns `002` for
+`video_id`.
 
 A video contains `id`, `name`, `owner_id` (the owning ad account), `upload_time`
 (Unix seconds), and `video_hash`. Only the name can change; the other fields are
@@ -99,9 +108,12 @@ An owned image contains `hash`, `owner_id`, `creation_time`, and `image_name`.
 `creation_time` is when that account first uploaded or ingested it (Unix seconds);
 re-uploading keeps the original time. `image_name` is the account's own label, or
 `None`: it is trimmed and must not be blank, otherwise upload returns `002` for
-`image_name`. Re-uploading with a name replaces the account's name; without one,
-the name is kept. Images ingested by `publish_ad` have no name. Accounts that
-upload the same bytes share the hash but keep separate names.
+`image_name`. Names are unique within an account (unnamed images are exempt);
+uploading a different image under a name the account already uses returns `002`
+for `image_name`, and the new image is not owned (its bytes stay stored).
+Re-uploading with a name replaces the account's name; without one, the name is
+kept. Images ingested by `publish_ad` have no name. Accounts that upload the same
+bytes share the hash but keep separate names.
 
 `list_videos` and `list_images` page by cursor. Pass the previous response's `next_cursor` to get
 the next page; it is `None` on the last page. Treat cursors as opaque. Pages
@@ -143,7 +155,7 @@ ad = service.publish_ad({
     "creator_id": account.id,
     "access_token": token,
     "text": "Discover our new collection",
-    "image": "sample.jpg",
+    "image": "https://cdn.example.com/ads/img1.jpg",
 })
 print(ad.id, ad.text, ad.image_hash)
 print(service.get_ad(ad.id).to_dict())
@@ -174,7 +186,7 @@ service = AdsService(repository, publisher=publisher)
 ```
 
 For different field policies, subclass `AdValidator` and override its
-`validate_creator`, `validate_text`, `validate_image`, or `validate_hash(value, creator_id)` methods,
+`validate_creator`, `validate_text`, `validate_image`, `validate_hash(value, creator_id)`, or `validate_image_name(value, creator_id)` methods,
 or supply a validator with a `validate(data) -> AdDraft` method. Account and
 projection validators are separate classes as well.
 
@@ -231,7 +243,7 @@ They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The suite has 86 tests, including boundary cases, storage failures, rollback, and
+The suite has 90 tests, including boundary cases, storage failures, rollback, and
 concurrent SQLite ad ID allocation, token and ownership enforcement, size limits, and image listing. See [VERIFICATION.md](VERIFICATION.md) for
 the test audit, deliberate regression checks, bugs fixed, and remaining limits.
 
