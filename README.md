@@ -243,7 +243,7 @@ They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The suite has 90 tests, including boundary cases, storage failures, rollback, and
+The suite has 76 tests, including boundary cases, storage failures, rollback, and
 concurrent SQLite ad ID allocation, token and ownership enforcement, size limits, and image listing. See [VERIFICATION.md](VERIFICATION.md) for
 the test audit, deliberate regression checks, bugs fixed, and remaining limits.
 

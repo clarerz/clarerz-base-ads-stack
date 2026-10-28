@@ -1,81 +1,75 @@
-# Refactor verification
-
-## Scope and sequence
-
-The first verification ran 24 existing behavior tests and 8 new refactor tests.
-It did not include an independent audit of the tests before using their results.
-A subsequent audit reviewed the assertions against the documented API and the
-committed implementation, added boundary and failure cases, and reran verification.
+# Test verification
 
 ## Test quality review
 
-- Tests assert exact returned values, fields, and error messages. Success/failure
-  expectations are not inferred from the implementation's validation rules.
+- Tests assert exact returned values, fields, and error messages. Expected values
+  are literals or derived independently (for example, `hashlib` over known bytes),
+  not computed by the code under test.
 - Each test gets fresh modules and temporary storage. Image, account, and ad
   records cannot leak across tests or modify the user's data directory.
-- Real SQLite storage is exercised; separate processes check durable account,
-  ad, and image reads. A legacy schema is built independently of the repository.
-- Mocks are limited to extension dependencies and deliberate failures. A real
-  registry write failure and a SQLite trigger exercise actual failure boundaries.
-- URL tests explicitly check metadata ingestion; they do not claim to test
-  downloading bytes or decoding the sample image.
+- Real SQLite storage is exercised; separate processes check durable account, ad,
+  image, and video reads. A legacy schema is built independently of the repository.
+- Failures are injected at real boundaries where possible: SQLite triggers reject
+  writes, the image registry rename or write fails, and a real repository has one
+  lookup replaced. Mock repositories are limited to read failures that triggers
+  cannot produce; storage doubles that pass validation return explicit records.
+- Pagination helpers are bounded, so a cursor that never ends fails instead of
+  hanging the suite.
 
 ## Coverage
 
-The suite contains 44 test methods, with parameterized subtests covering:
+76 test methods, with parameterized subtests, cover:
 
 | Area | Checks |
 | --- | --- |
-| Account/ad API | Creation, account replacement, owner reference, reads, ID coercion, text normalization, metadata, missing records. |
-| Validation | Required fields, wrong input types, unknown fields, text rules, malformed URLs/files, hash length/character boundaries, Unicode digits. |
-| Reads | Full objects, exact projection, string/tuple/set projections, empty projections, invalid field types. |
-| Images | URL/file ingestion, file content hashes/copies, deduplication, hash-only publication, malformed adapter outputs, failed registry writes. |
-| Domain objects | Object returns, dictionary serialization, immutability. |
-| Extensibility | Extra validation rules, custom publish stage, injected image storage and clock. |
-| Persistence | Fresh-process reads, legacy schema compatibility, failed-insert rollback, concurrent SQLite ad ID allocation. |
-| Failure handling | Rejection before ingestion, no ad after image failure, object exceptions, dictionary error translation. |
-
-## Bugs found and corrected
-
-1. The inherited image registry swallowed write errors and could allow publishing
-   to report success for an image that was not persisted. Write failures now propagate.
-2. The new publisher accepted malformed nonempty hashes from custom image storage.
-   It now checks the normalized handle's format before persisting an ad.
-3. The inherited numeric coercion used `isdigit()` without handling characters
-   such as superscripts that `int()` cannot parse. They now produce the normal
-   invalid-ID behavior.
-
-The new regression tests failed before these fixes and passed afterward.
+| Accounts and tokens | Creation, one-time token stored as a hash, rename with token, no overwrite by ID, token reissue, legacy accounts without tokens. |
+| Authentication | Every write and image listing rejects missing, wrong, non-string, and other accounts' tokens; authentication runs before ownership checks; failed lookups fail closed. |
+| Ad publishing | Full stored record, ID uniqueness, text and ID normalization, unknown and missing fields, exactly one image field, link-only `image`, hash and name resolution, video ads. |
+| Image ownership | Upload and link ingestion grant ownership; other accounts' and unstored images are rejected; names are per account and unique within it. |
+| Uploads | Content hashes, durable copies in the data directory, deduplication, real 30 MiB image boundary, video size limit, partial-copy cleanup, input validation before storage. |
+| Listings | Newest-first keyset pagination, tie order, stability across new rows, inclusive/exclusive time filters, invalid parameters, storage failures. |
+| Reads | Full objects, projections of every supported shape, invalid projections, missing records. |
+| Image registry | Seeded records, metadata-only URL ingestion, damaged registry left untouched, interrupted writes keep the previous registry. |
+| Extensibility | Extra validation rules, custom publish stage, injected image storage and clock, validator using the publisher's storage. |
+| Persistence | Fresh-process reads, legacy schema migration, failed-insert rollback, concurrent ad ID allocation, error dictionaries for storage failures. |
 
 ## Regression detection
 
-Eight deliberate mutations were made in temporary copies. Each ran the full
-suite, produced assertion failures, and was detected:
+Each production rule was broken in a temporary copy and the full suite was run;
+every mutation below produced failures:
 
-- Accept unknown input fields.
-- Accept nonexistent creators.
-- Skip custom validation rules.
-- Ignore image normalization.
-- Return extra fields in projections.
-- Make domain objects mutable.
-- Return missing persisted ads.
-- Ignore the injected clock.
+- Accept unknown fields or nonexistent creators; skip custom rules or image
+  normalization; return extra projected fields or missing ads; ignore the clock.
+- Make a domain object mutable.
+- Skip authentication on publish, upload, video rename, or image listing; let a
+  failed token lookup pass; allow an account to be overwritten by ID.
+- Remove the size cap or change the image limit's units.
+- Skip image ownership or image-store checks; check a different storage than the
+  publisher's; accept non-link `image` values or more than one image field; skip
+  the store check for names.
+- Ignore name conflicts, report any integrity error as a name conflict, drop the
+  unique name index, or clear a name on an unnamed re-upload.
+- Read a damaged registry as empty or lose a registry write.
+- Reverse the tie order, make `since` exclusive or `until` inclusive, or accept
+  an image cursor with a trailing newline.
+- Skip the video extension check, or raise from `rename_video` on storage failure.
 
-This checks that the suite can detect these specific regressions; it is not an
-exhaustive mutation score or a proof of correctness.
+This shows the suite detects these specific regressions; it is not an exhaustive
+mutation score or a proof of correctness.
 
 ## Result and limits
 
-All 44 tests pass using:
+All 76 tests pass using:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers the current local API and refactor requirements. It does not
-establish production readiness. Inherited limitations include metadata-only URL
-ingestion, no image-format validation, unchecked existence of caller-provided
-hashes, and a JSON image registry without concurrent-writer coordination or an
-atomic transaction shared with the ads database. The concurrency test covers
-SQLite ad allocation, not concurrent image ingestion. Disk exhaustion, process
-crashes during file writes, and every possible extension are not simulated.
+Not covered: closing a connection when schema setup fails, and the race where two
+processes add the same column. `image_store.get_image`, `image_exists`, and
+`validate_image_reference` have no callers and no tests. Remaining limitations:
+metadata-only URL ingestion, no image-format validation, a JSON image registry
+without concurrent-writer coordination (simultaneous ingestions can lose a record)
+or a transaction shared with the ads database, and rejected uploads (duplicate
+name, failed video insert) can leave unowned bytes in storage. Disk exhaustion and
+process crashes are simulated only at the registry write and the copy loop.
