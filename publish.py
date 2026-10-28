@@ -16,10 +16,14 @@ def _service():
     return AdsService(SQLiteAdsRepository(DB_PATH))
 
 
-def create_account(account_id, name):
+def create_account(account_id, name, access_token=None):
+    """Create an account and return its one-time access token; with a token, rename it instead."""
     try:
-        account = _service().create_account(account_id, name)
-        return {"id": account.id}
+        service = _service()
+        if access_token is None:
+            account, token = service.create_account(account_id, name)
+            return {"id": account.id, "access_token": token}
+        return {"id": service.rename_account(account_id, name, access_token).id}
     except ValidationError as exc:
         return exc.to_dict()
     except Exception:
@@ -61,6 +65,15 @@ def get_ad(ad_id):
     return get_ads(ad_id)
 
 
+def upload_image(data):
+    try:
+        return {"hash": _service().upload_image(data)}
+    except ValidationError as exc:
+        return exc.to_dict()
+    except Exception:
+        return ValidationError("002", "data").to_dict()
+
+
 def upload_video(data):
     try:
         video = _service().upload_video(data)
@@ -71,9 +84,9 @@ def upload_video(data):
         return ValidationError("002", "data").to_dict()
 
 
-def rename_video(video_id, name):
+def rename_video(video_id, name, access_token=None):
     try:
-        video = _service().rename_video(video_id, name)
+        video = _service().rename_video(video_id, name, access_token)
         return {"id": video.id}
     except ValidationError as exc:
         return exc.to_dict()

@@ -1,26 +1,48 @@
-"""Object API for account management, ad publishing/reads, and video uploads."""
+"""Object API for accounts, ad publishing/reads, and image and video uploads."""
 
+import secrets
 import time
 
-from publishing import AdPublisher
-from validation import (AccountValidator, ValidationError, VideoValidator, coerce_id,
-                        encode_cursor, validate_video_name)
+import image_store
+from publishing import AdPublisher, store_owned_image
+from validation import (AccountValidator, UploadValidator, ValidationError, VideoValidator,
+                        authenticate, coerce_id, encode_cursor, hash_token, validate_video_name)
 import video_store
 
 
 class AdsService:
-    def __init__(self, repository, publisher=None, account_validator=None, video_storage=None):
+    def __init__(self, repository, publisher=None, account_validator=None, video_storage=None,
+                 image_storage=None):
         self.repository = repository
         self.publisher = publisher if publisher is not None else AdPublisher(repository)
         self.account_validator = (account_validator if account_validator is not None
                                   else AccountValidator())
+        self.image_validator = UploadValidator(repository)
         self.video_validator = VideoValidator(repository)
         self.video_storage = video_storage if video_storage is not None else video_store
+        self.image_storage = image_storage if image_storage is not None else image_store
 
     def create_account(self, account_id, name):
+        """Return (account, access_token). Only a hash is stored, so the token cannot be recovered."""
         account = self.account_validator.validate(account_id, name)
-        self.repository.save_account(account)
+        token = secrets.token_urlsafe(32)
+        if not self.repository.insert_account(account, hash_token(token)):
+            raise ValidationError("002", "account_id")
+        return account, token
+
+    def rename_account(self, account_id, name, access_token):
+        account = self.account_validator.validate(account_id, name)
+        authenticate(self.repository, account.id, access_token)
+        self.repository.rename_account(account.id, account.name)
         return account
+
+    def issue_access_token(self, account_id):
+        """Operator action: replace an account's token, or give a pre-authentication account one."""
+        account_id = coerce_id(account_id)
+        token = secrets.token_urlsafe(32)
+        if account_id is None or not self.repository.set_token_hash(account_id, hash_token(token)):
+            raise ValidationError("002", "account_id")
+        return token
 
     def get_account(self, account_id):
         account_id = coerce_id(account_id)
@@ -33,6 +55,11 @@ class AdsService:
         ad_id = coerce_id(ad_id)
         return None if ad_id is None else self.repository.get_ad(ad_id)
 
+    def upload_image(self, data):
+        """Store an image for its authenticated owner and return the image's content hash."""
+        owner_id, path = self.image_validator.validate(data)
+        return store_owned_image(self.repository, self.image_storage, owner_id, path, "file")
+
     def upload_video(self, data):
         owner_id, name, path = self.video_validator.validate(data)
         try:
@@ -43,14 +70,17 @@ class AdsService:
         # unreferenced (deduplicated) file; add a cleanup sweep if that matters.
         return self.repository.save_video(owner_id, name, video_hash, int(time.time()))
 
-    def rename_video(self, video_id, name):
+    def rename_video(self, video_id, name, access_token=None):
         video_id = coerce_id(video_id)
         if video_id is None:
             raise ValidationError("002", "video_id")
-        video = self.repository.rename_video(video_id, validate_video_name(name))
+        name = validate_video_name(name)
+        video = self.repository.get_video(video_id)
         if video is None:
             raise ValidationError("002", "video_id")
-        return video
+        # A wrong token gets the same error as a missing video, so callers cannot probe IDs.
+        authenticate(self.repository, video.owner_id, access_token, field="video_id")
+        return self.repository.rename_video(video_id, name)
 
     def list_videos(self, owner_id, limit=None, cursor=None, since=None, until=None):
         """Return (videos, next_cursor) for one page; next_cursor is None on the last page."""

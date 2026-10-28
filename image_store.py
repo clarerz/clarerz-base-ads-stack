@@ -7,8 +7,9 @@ image bytes. Local files are copied and hashed by content.
 import hashlib
 import json
 import os
-import shutil
 from typing import Dict, List, Optional
+
+import file_store
 
 _SEEDED_PATH = os.path.join(os.path.dirname(__file__), "images.json")
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +18,7 @@ _DATA_DIR = os.path.abspath(os.path.expanduser(
 ))
 _PERSIST_DIR = os.path.join(_DATA_DIR, "image_store_data")
 _PERSIST_FILE = os.path.join(_PERSIST_DIR, "persisted_images.json")
+MAX_IMAGE_BYTES = 30 * 1024 * 1024  # Meta's ad image maximum
 
 # Image data is stored separately from the ads database.
 os.makedirs(_PERSIST_DIR, exist_ok=True)
@@ -51,18 +53,6 @@ def _save_persisted(images: List[Dict]) -> None:
 def _hash_for_url(url: str) -> str:
     # Deterministic alphanumeric hash for URLs (32-char hex)
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
-
-
-def _hash_for_file(path: str) -> str:
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-    except Exception:
-        # Fallback to path-based hash if unreadable
-        return _hash_for_url(path)
-    return h.hexdigest()[:32]
 
 
 def list_images() -> List[Dict]:
@@ -155,18 +145,14 @@ def store_image(image_input: str) -> Dict:
         )
 
     try:
-        file_hash = _hash_for_file(real_path)
+        # Copy and hash in one pass; files over MAX_IMAGE_BYTES raise ValueError.
+        suffix = os.path.splitext(real_path)[1] or ".bin"
+        file_hash = file_store.store_file(real_path, _PERSIST_DIR, MAX_IMAGE_BYTES, suffix)
         # Deduplicate by hash
         existing = get_image_by_hash(file_hash)
         if existing:
             return existing
-
-        # Copy file to persist dir for durability
-        dest_path = os.path.join(
-            _PERSIST_DIR, f"{file_hash}{os.path.splitext(real_path)[1] or '.bin'}"
-        )
-        if not os.path.exists(dest_path):
-            shutil.copy2(real_path, dest_path)
+        dest_path = os.path.join(_PERSIST_DIR, f"{file_hash}{suffix}")
 
         new_id = f"img_{file_hash[:8]}"
         entry = {

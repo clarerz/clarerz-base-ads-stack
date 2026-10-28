@@ -12,6 +12,18 @@ class ImageStorage(Protocol):
     def store_image(self, image_input: str) -> dict: ...
 
 
+def store_owned_image(repository, image_storage, owner_id, image_input, field):
+    """Ingest an image, record owner_id as an owner of its hash, and return the hash."""
+    try:
+        image_hash = image_storage.store_image(image_input)["hash"]
+        if not isinstance(image_hash, str) or not HASH_REGEX.fullmatch(image_hash):
+            raise ValueError("Image storage returned an invalid handle")
+    except Exception as exc:
+        raise ValidationError("002", field) from exc
+    repository.grant_image(owner_id, image_hash)
+    return image_hash
+
+
 class AdPublisher:
     def __init__(self, repository, validator=None, image_storage=None, clock=None):
         self.repository = repository
@@ -27,13 +39,8 @@ class AdPublisher:
     def normalize_image(self, draft):
         if draft.image is None:
             return draft
-        try:
-            stored = self.image_storage.store_image(draft.image)
-            image_hash = stored["hash"]
-            if not isinstance(image_hash, str) or not HASH_REGEX.fullmatch(image_hash):
-                raise ValueError("Image storage returned an invalid handle")
-        except Exception as exc:
-            raise ValidationError("002", "image") from exc
+        image_hash = store_owned_image(self.repository, self.image_storage, draft.creator_id,
+                                       draft.image, "image")
         return replace(draft, image=None, image_hash=image_hash)
 
     def persist(self, draft):

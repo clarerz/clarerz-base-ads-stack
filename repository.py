@@ -9,8 +9,13 @@ from models import Ad, AdAccount, AdDraft, Video
 
 
 class AdsRepository(Protocol):
-    def save_account(self, account: AdAccount) -> None: ...
+    def insert_account(self, account: AdAccount, token_hash: str) -> bool: ...
+    def rename_account(self, account_id: int, name: str) -> None: ...
     def get_account(self, account_id: int) -> Optional[AdAccount]: ...
+    def get_token_hash(self, account_id: int) -> Optional[str]: ...
+    def set_token_hash(self, account_id: int, token_hash: str) -> bool: ...
+    def grant_image(self, owner_id: int, image_hash: str) -> None: ...
+    def owns_image(self, owner_id: int, image_hash: str) -> bool: ...
     def save_ad(self, draft: AdDraft, creation_time: int) -> Ad: ...
     def get_ad(self, ad_id: int) -> Optional[Ad]: ...
     def save_video(self, owner_id: int, name: str, video_hash: str, upload_time: int) -> Video: ...
@@ -28,45 +33,82 @@ class SQLiteAdsRepository:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         try:
-            conn.execute("CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, name TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, name TEXT, "
+                         "token_hash TEXT)")
+            self._add_column(conn, "accounts", "token_hash TEXT")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS ads (id INTEGER PRIMARY KEY, system_name TEXT, "
                 "image_hash TEXT, text_content TEXT, creator_id INTEGER, creation_time INTEGER, "
                 "video_id INTEGER)"
             )
-            self._add_ads_video_column(conn)
+            self._add_column(conn, "ads", "video_id INTEGER")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS videos (id INTEGER PRIMARY KEY, name TEXT, "
                 "owner_id INTEGER, upload_time INTEGER, video_hash TEXT)"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS videos_by_owner_time "
                          "ON videos (owner_id, upload_time)")
+            # Identical image bytes share one hash; each account that ingested them owns it.
+            conn.execute("CREATE TABLE IF NOT EXISTS image_owners (owner_id INTEGER, "
+                         "image_hash TEXT, PRIMARY KEY (owner_id, image_hash))")
         except Exception:
             conn.close()
             raise
         return conn
 
     @staticmethod
-    def _add_ads_video_column(conn):
-        # Databases created before video ads lack the column; add it in place.
-        if "video_id" in {row[1] for row in conn.execute("PRAGMA table_info(ads)")}:
+    def _add_column(conn, table, column):
+        # Databases created before a feature lack its column; add it in place.
+        if column.split()[0] in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
             return
         try:
-            conn.execute("ALTER TABLE ads ADD COLUMN video_id INTEGER")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
         except sqlite3.OperationalError as exc:
             # Another connection added it first.
             if "duplicate column" not in str(exc):
                 raise
 
-    def save_account(self, account):
+    def insert_account(self, account, token_hash):
+        """Return False, changing nothing, if the account ID is taken."""
         with closing(self._connect()) as conn, conn:
-            conn.execute("INSERT OR REPLACE INTO accounts (id, name) VALUES (?, ?)",
-                         (account.id, account.name))
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO accounts (id, name, token_hash) VALUES (?, ?, ?)",
+                (account.id, account.name, token_hash),
+            )
+        return cursor.rowcount == 1
+
+    def rename_account(self, account_id, name):
+        with closing(self._connect()) as conn, conn:
+            conn.execute("UPDATE accounts SET name = ? WHERE id = ?", (name, account_id))
 
     def get_account(self, account_id):
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT id, name FROM accounts WHERE id = ?", (account_id,)).fetchone()
         return AdAccount(*row) if row is not None else None
+
+    def get_token_hash(self, account_id):
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT token_hash FROM accounts WHERE id = ?",
+                               (account_id,)).fetchone()
+        return row[0] if row is not None else None
+
+    def set_token_hash(self, account_id, token_hash):
+        """Return False if the account does not exist."""
+        with closing(self._connect()) as conn, conn:
+            cursor = conn.execute("UPDATE accounts SET token_hash = ? WHERE id = ?",
+                                  (token_hash, account_id))
+        return cursor.rowcount == 1
+
+    def grant_image(self, owner_id, image_hash):
+        with closing(self._connect()) as conn, conn:
+            conn.execute("INSERT OR IGNORE INTO image_owners (owner_id, image_hash) VALUES (?, ?)",
+                         (owner_id, image_hash))
+
+    def owns_image(self, owner_id, image_hash):
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT 1 FROM image_owners WHERE owner_id = ? AND image_hash = ?",
+                               (owner_id, image_hash)).fetchone()
+        return row is not None
 
     def save_ad(self, draft, creation_time):
         with closing(self._connect()) as conn, conn:

@@ -1,5 +1,7 @@
 """Validation rules without image ingestion or ad/account writes."""
 
+import hashlib
+import hmac
 import os
 from pathlib import Path
 import re
@@ -39,6 +41,23 @@ def coerce_id(value):
     return None
 
 
+def hash_token(token):
+    # Tokens are 256-bit random values, so a fast unsalted hash is enough to store them.
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def authenticate(repository, account_id, token, field="access_token"):
+    """Raise ValidationError unless token is the account's current access token."""
+    try:
+        stored = repository.get_token_hash(account_id)
+    except Exception as exc:
+        raise ValidationError("002", field) from exc
+    # Accounts created before authentication have no token until one is issued.
+    if (not isinstance(stored, str) or not isinstance(token, str) or not token.isascii()
+            or not hmac.compare_digest(stored, hash_token(token))):
+        raise ValidationError("002", field)
+
+
 class AccountValidator:
     def validate(self, account_id, name):
         account_id = coerce_id(account_id)
@@ -50,7 +69,8 @@ class AccountValidator:
 
 
 class AdValidator:
-    allowed_fields = frozenset({"creator_id", "text", "image", "image_hash", "video_id"})
+    allowed_fields = frozenset({"creator_id", "access_token", "text", "image", "image_hash",
+                                "video_id"})
 
     def __init__(self, repository, base_dir=None, rules=()):
         self.repository = repository
@@ -75,9 +95,12 @@ class AdValidator:
         if "creator_id" not in data:
             raise ValidationError("002", "creator_id")
         creator_id = self.validate_creator(data["creator_id"])
+        # Authenticate before ownership checks so they reveal nothing to other callers.
+        authenticate(self.repository, creator_id, data.get("access_token"))
         text = self.validate_text(data["text"])
         image = self.validate_image(data["image"]) if "image" in data else None
-        image_hash = self.validate_hash(data["image_hash"]) if "image_hash" in data else None
+        image_hash = (self.validate_hash(data["image_hash"], creator_id)
+                      if "image_hash" in data else None)
         video_id = (self.validate_video(data["video_id"], creator_id)
                     if "video_id" in data else None)
         draft = AdDraft(creator_id, text, image, image_hash, video_id)
@@ -123,8 +146,15 @@ class AdValidator:
                 return str(candidate.resolve())
         raise ValidationError("002", "image")
 
-    def validate_hash(self, value):
+    def validate_hash(self, value, creator_id):
+        # Only images the creator uploaded or ingested may be used.
         if not isinstance(value, str) or not HASH_REGEX.match(value.strip()):
+            raise ValidationError("002", "image_hash")
+        try:
+            owned = self.repository.owns_image(creator_id, value.strip())
+        except Exception as exc:
+            raise ValidationError("002", "image_hash") from exc
+        if not owned:
             raise ValidationError("002", "image_hash")
         return value.strip()
 
@@ -149,24 +179,32 @@ def validate_video_name(value):
     return value.strip()
 
 
-class VideoValidator:
-    allowed_fields = frozenset({"owner_id", "name", "file"})
+class UploadValidator:
+    """Image uploads; videos extend it. The owner must authenticate before anything is stored."""
+
+    required_fields = ("owner_id", "access_token", "file")
 
     def __init__(self, repository):
         self.repository = repository
 
     def validate(self, data):
-        """Return (owner_id, name, absolute file path) for a valid upload request."""
+        """Return (owner_id, absolute file path) for a valid upload request."""
+        owner_id = self.validate_request(data)
+        return owner_id, self.validate_file(data["file"])
+
+    def validate_request(self, data):
+        """Check field names, then return the authenticated owner ID."""
         if not isinstance(data, dict):
             raise ValidationError("002", "data")
         for field in data:
-            if field not in self.allowed_fields:
+            if field not in self.required_fields:
                 raise ValidationError("001", field)
-        for field in ("owner_id", "name", "file"):
+        for field in self.required_fields:
             if field not in data:
                 raise ValidationError("002", field)
-        return (self.validate_owner(data["owner_id"]), validate_video_name(data["name"]),
-                self.validate_file(data["file"]))
+        owner_id = self.validate_owner(data["owner_id"])
+        authenticate(self.repository, owner_id, data["access_token"])
+        return owner_id
 
     def validate_owner(self, value):
         owner_id = coerce_id(value)
@@ -181,13 +219,29 @@ class VideoValidator:
         return owner_id
 
     def validate_file(self, value):
-        # Uploads come from local files only; the extension is the only format check.
+        # Uploads come from local files only; storage enforces the size limit.
         if not isinstance(value, str) or not value.strip():
             raise ValidationError("002", "file")
         path = Path(value.strip()).expanduser()
-        if path.suffix.lower() not in VIDEO_EXTENSIONS or not path.is_file():
+        if not path.is_file():
             raise ValidationError("002", "file")
         return str(path.resolve())
+
+
+class VideoValidator(UploadValidator):
+    required_fields = ("owner_id", "access_token", "name", "file")
+
+    def validate(self, data):
+        """Return (owner_id, name, absolute file path) for a valid upload request."""
+        owner_id = self.validate_request(data)
+        return owner_id, validate_video_name(data["name"]), self.validate_file(data["file"])
+
+    def validate_file(self, value):
+        # The extension is the only video format check.
+        path = super().validate_file(value)
+        if Path(value.strip()).suffix.lower() not in VIDEO_EXTENSIONS:
+            raise ValidationError("002", "file")
+        return path
 
     def validate_query(self, owner_id, limit=None, cursor=None, since=None, until=None):
         """Return (owner_id, limit, cursor position, since, until) for a video listing."""
