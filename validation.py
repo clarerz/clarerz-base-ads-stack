@@ -10,6 +10,9 @@ from models import AdAccount, AdDraft
 
 URL_REGEX = re.compile(r"^https?://[^\s]+$")
 HASH_REGEX = re.compile(r"^[A-Za-z0-9]{16,64}$")
+# Text that is only hex digits looks like a pasted image hash; long words do not.
+HEX_HASH_REGEX = re.compile(r"^[0-9A-Fa-f]{16,64}$")
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"})
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 100
@@ -20,24 +23,33 @@ class ValidationError(ValueError):
     def __init__(self, code, field):
         self.code = code
         self.field = field
-        message = (f"{field} is an invalid field on this endpoint" if code == "001"
-                   else f"The value provided for {field} is invalid")
+        message = {"001": f"{field} is an invalid field on this endpoint",
+                   "003": f"Storage failed while handling {field}"}.get(
+                       code, f"The value provided for {field} is invalid")
         super().__init__(message)
 
     def to_dict(self):
         return {"error_code": self.code, "error_message": str(self)}
 
 
+class StorageError(ValidationError):
+    """A storage read or write failed (003); the request itself may be valid."""
+
+    def __init__(self, field):
+        super().__init__("003", field)
+
+
 def coerce_id(value):
+    """Return value as an int in SQLite's non-negative integer range, else None."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, int):
-        return value
     if isinstance(value, str) and value.strip().isdigit():
         try:
-            return int(value.strip())
+            value = int(value.strip())
         except ValueError:
             return None
+    if isinstance(value, int) and 0 <= value <= _MAX_SQLITE_INT:
+        return value
     return None
 
 
@@ -51,7 +63,7 @@ def authenticate(repository, account_id, token, field="access_token"):
     try:
         stored = repository.get_token_hash(account_id)
     except Exception as exc:
-        raise ValidationError("002", field) from exc
+        raise StorageError(field) from exc
     # Accounts created before authentication have no token until one is issued.
     if (not isinstance(stored, str) or not isinstance(token, str) or not token.isascii()
             or not hmac.compare_digest(stored, hash_token(token))):
@@ -116,22 +128,13 @@ class AdValidator:
         return draft
 
     def validate_creator(self, value):
-        creator_id = coerce_id(value)
-        if creator_id is None:
-            raise ValidationError("002", "creator_id")
-        try:
-            account = self.repository.get_account(creator_id)
-        except Exception as exc:
-            raise ValidationError("002", "creator_id") from exc
-        if account is None:
-            raise ValidationError("002", "creator_id")
-        return creator_id
+        return existing_account_id(self.repository, value, "creator_id")
 
     def validate_text(self, value):
         if not isinstance(value, str) or len(value.strip()) < 3:
             raise ValidationError("002", "text")
         value = value.strip()
-        if URL_REGEX.match(value) or HASH_REGEX.match(value):
+        if URL_REGEX.match(value) or HEX_HASH_REGEX.match(value):
             raise ValidationError("002", "text")
         return value
 
@@ -152,7 +155,7 @@ class AdValidator:
         try:
             image_hash = self.repository.get_image_hash_by_name(creator_id, name)
         except Exception as exc:
-            raise ValidationError("002", "image_name") from exc
+            raise StorageError("image_name") from exc
         if image_hash is None:
             raise ValidationError("002", "image_name")
         return self.check_owned_image(creator_id, image_hash, "image_name")
@@ -164,7 +167,7 @@ class AdValidator:
             valid = (self.repository.owns_image(creator_id, image_hash)
                      and self.image_storage.get_image_by_hash(image_hash) is not None)
         except Exception as exc:
-            raise ValidationError("002", field) from exc
+            raise StorageError(field) from exc
         if not valid:
             raise ValidationError("002", field)
         return image_hash
@@ -178,7 +181,7 @@ class AdValidator:
         try:
             video = self.repository.get_video(video_id)
         except Exception as exc:
-            raise ValidationError("002", "video_id") from exc
+            raise StorageError("video_id") from exc
         if video is None or video.owner_id != creator_id:
             raise ValidationError("002", "video_id")
         return video_id
@@ -195,6 +198,7 @@ class UploadValidator:
 
     required_fields = ("owner_id", "access_token", "file")
     optional_fields = ("image_name",)
+    extensions = IMAGE_EXTENSIONS
 
     def __init__(self, repository):
         self.repository = repository
@@ -222,37 +226,22 @@ class UploadValidator:
 
     def validate_query(self, owner_id, limit=None, cursor=None, since=None, until=None):
         """Return (owner_id, limit, cursor position, since, until) for a listing."""
-        owner_id = self.validate_owner(owner_id)
-        if limit is None:
-            limit = DEFAULT_PAGE_SIZE
-        else:
-            limit = coerce_id(limit)
-            if limit is None or not 1 <= limit <= MAX_PAGE_SIZE:
-                raise ValidationError("002", "limit")
-        return (owner_id, limit, self.decode_cursor(cursor),
-                _optional_time(since, "since"), _optional_time(until, "until"))
+        return (self.validate_owner(owner_id),
+                *validate_page(limit, cursor, since, until, self.decode_cursor))
 
     def decode_cursor(self, value):
         return decode_image_cursor(value)
 
     def validate_owner(self, value):
-        owner_id = coerce_id(value)
-        if owner_id is None:
-            raise ValidationError("002", "owner_id")
-        try:
-            account = self.repository.get_account(owner_id)
-        except Exception as exc:
-            raise ValidationError("002", "owner_id") from exc
-        if account is None:
-            raise ValidationError("002", "owner_id")
-        return owner_id
+        return existing_account_id(self.repository, value, "owner_id")
 
     def validate_file(self, value):
         # Uploads come from local files only; storage enforces the size limit.
         if not isinstance(value, str) or not value.strip():
             raise ValidationError("002", "file")
         path = Path(value.strip()).expanduser()
-        if not path.is_file():
+        # The extension is the only format check.
+        if not path.is_file() or path.suffix.lower() not in self.extensions:
             raise ValidationError("002", "file")
         return str(path.resolve())
 
@@ -260,29 +249,49 @@ class UploadValidator:
 class VideoValidator(UploadValidator):
     required_fields = ("owner_id", "access_token", "name", "file")
     optional_fields = ()
+    extensions = VIDEO_EXTENSIONS
 
     def validate(self, data):
         """Return (owner_id, name, absolute file path) for a valid upload request."""
         owner_id = self.validate_request(data)
         return owner_id, validate_name(data["name"]), self.validate_file(data["file"])
 
-    def validate_file(self, value):
-        # The extension is the only video format check.
-        path = super().validate_file(value)
-        if Path(value.strip()).suffix.lower() not in VIDEO_EXTENSIONS:
-            raise ValidationError("002", "file")
-        return path
-
     def decode_cursor(self, value):
         return decode_video_cursor(value)
 
+
+
+def existing_account_id(repository, value, field):
+    """Return value as the ID of an existing account; field names it in errors."""
+    account_id = coerce_id(value)
+    if account_id is None:
+        raise ValidationError("002", field)
+    try:
+        account = repository.get_account(account_id)
+    except Exception as exc:
+        raise StorageError(field) from exc
+    if account is None:
+        raise ValidationError("002", field)
+    return account_id
+
+
+def validate_page(limit, cursor, since, until, decode_cursor):
+    """Return (limit, cursor position, since, until) for one page of a listing."""
+    if limit is None:
+        limit = DEFAULT_PAGE_SIZE
+    else:
+        limit = coerce_id(limit)
+        if limit is None or not 1 <= limit <= MAX_PAGE_SIZE:
+            raise ValidationError("002", "limit")
+    return (limit, decode_cursor(cursor),
+            _optional_time(since, "since"), _optional_time(until, "until"))
 
 
 def _optional_time(value, field):
     if value is None:
         return None
     timestamp = coerce_id(value)
-    if timestamp is None or not 0 <= timestamp <= _MAX_SQLITE_INT:
+    if timestamp is None:
         raise ValidationError("002", field)
     return timestamp
 
@@ -292,14 +301,22 @@ def encode_video_cursor(video):
 
 
 def decode_video_cursor(value):
-    """Return the (upload_time, id) position after which the next page starts."""
+    """Return the (time, id) position after which the next page starts."""
     if value is None:
         return None
     parts = value.split(":") if isinstance(value, str) else ()
     position = tuple(coerce_id(part) for part in parts)
-    if len(position) != 2 or None in position or max(position) > _MAX_SQLITE_INT:
+    if len(position) != 2 or None in position:
         raise ValidationError("002", "cursor")
     return position
+
+
+def encode_ad_cursor(ad):
+    return f"{ad.creation_time}:{ad.id}"
+
+
+# Ad cursors have the video format: a (time, id) position.
+decode_ad_cursor = decode_video_cursor
 
 
 def encode_image_cursor(image):
@@ -312,8 +329,7 @@ def decode_image_cursor(value):
         return None
     timestamp, _, image_hash = value.partition(":") if isinstance(value, str) else ("", "", "")
     timestamp = coerce_id(timestamp)
-    if (timestamp is None or timestamp > _MAX_SQLITE_INT
-            or not HASH_REGEX.fullmatch(image_hash)):
+    if timestamp is None or not HASH_REGEX.fullmatch(image_hash):
         raise ValidationError("002", "cursor")
     return timestamp, image_hash
 
@@ -324,7 +340,8 @@ class ProjectionValidator:
         if fields is None:
             return data
         if isinstance(fields, str):
-            fields = [fields]
+            # "text, image_hash" names two fields, as in Graph API requests.
+            fields = [field.strip() for field in fields.split(",")]
         if not isinstance(fields, (list, tuple, set)):
             raise ValidationError("002", "fields")
         if not fields:

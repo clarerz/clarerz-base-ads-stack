@@ -12,21 +12,27 @@ def store_file(path, directory, max_bytes, suffix="") -> str:
     directory.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
     size = 0
-    tmp = tempfile.NamedTemporaryFile(dir=directory, delete=False)
     try:
-        # Hash while copying, then rename, so a failed or oversized copy never leaves a
-        # partial file. Counting copied bytes enforces the cap even if the source grows.
-        with open(path, "rb") as src, tmp:
-            for chunk in iter(lambda: src.read(1 << 20), b""):
-                size += len(chunk)
-                if size > max_bytes:
-                    raise ValueError(f"file exceeds {max_bytes} bytes")
-                digest.update(chunk)
-                tmp.write(chunk)
-        file_hash = digest.hexdigest()[:32]
-        # Identical content maps to the same name, so re-uploads deduplicate.
-        os.replace(tmp.name, directory / f"{file_hash}{suffix}")
-    except BaseException:
-        os.unlink(tmp.name)
-        raise
+        src = open(path, "rb")
+    except OSError as exc:
+        # An unreadable or vanished source is the caller's input, not a storage failure.
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    with src:
+        tmp = tempfile.NamedTemporaryFile(dir=directory, delete=False)
+        try:
+            # Hash while copying, then rename, so a failed or oversized copy never leaves a
+            # partial file. Counting copied bytes enforces the cap even if the source grows.
+            with tmp:
+                for chunk in iter(lambda: src.read(1 << 20), b""):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ValueError(f"file exceeds {max_bytes} bytes")
+                    digest.update(chunk)
+                    tmp.write(chunk)
+            file_hash = digest.hexdigest()[:32]
+            # Identical content maps to the same name, so re-uploads deduplicate.
+            os.replace(tmp.name, directory / f"{file_hash}{suffix}")
+        except BaseException:
+            os.unlink(tmp.name)
+            raise
     return file_hash

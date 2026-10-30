@@ -4,11 +4,13 @@ Use the canonical API and isolated temporary storage instead of API discovery
 and the benchmark worker. Persistence is also checked in a fresh Python process.
 """
 
+from contextlib import closing
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,7 @@ class AdsStackTests(unittest.TestCase):
         modules.start()
         self.addCleanup(modules.stop)
         # Load fresh modules after setting storage, without creating project data.
-        for name in ("models", "repository", "validation", "file_store", "image_store",
+        for name in ("config", "models", "repository", "validation", "file_store", "image_store",
                      "video_store", "publishing", "service", "publish"):
             spec = importlib.util.spec_from_file_location(name, BASE_DIR / f"{name}.py")
             module = importlib.util.module_from_spec(spec)
@@ -65,8 +67,9 @@ class AdsStackTests(unittest.TestCase):
         self.assertIsInstance(response, dict)
         self.assertEqual(set(response), {"error_code", "error_message"})
         self.assertEqual(response["error_code"], code)
-        message = (f"{field} is an invalid field on this endpoint" if code == "001"
-                   else f"The value provided for {field} is invalid")
+        message = {"001": f"{field} is an invalid field on this endpoint",
+                   "003": f"Storage failed while handling {field}"}.get(
+                       code, f"The value provided for {field} is invalid")
         self.assertEqual(response["error_message"], message)
 
     def fresh_process(self, code):
@@ -135,11 +138,41 @@ class AdsStackTests(unittest.TestCase):
             self.assertEqual(self.image_store.get_image_by_url(image["url"]), image)
             self.assertEqual(self.image_store.get_image_by_hash(image["hash"]), image)
 
+    def test_unreadable_seed_file_fails_instead_of_dropping_seeds(self):
+        missing = self.data_dir / "missing.json"
+        with patch.object(self.image_store, "_SEEDED_PATH", str(missing)):
+            self.assertEqual(self.image_store.list_images(), [])
+        unparsable = self.data_dir / "seeds.json"
+        unparsable.write_text("{not json")
+        unreadable = self.data_dir / "seeds_dir.json"
+        unreadable.mkdir()
+        for damaged in (unparsable, unreadable):
+            with self.subTest(damaged=damaged.name):
+                with patch.object(self.image_store, "_SEEDED_PATH", str(damaged)):
+                    with self.assertRaises(RuntimeError):
+                        self.image_store.get_image_by_hash(self.seeded[0]["hash"])
+                    self.assert_error(self.publish.publish_ad(self.payload()), "003", "image")
+                self.assertIsNone(self.publish.get_ad(1))
+
     def test_invalid_text_value_002(self):
         for text in ("", "  ", "ab", None, 123, self.seeded[0]["url"], self.seeded[0]["hash"]):
             with self.subTest(text=text):
                 self.assert_error(self.publish.publish_ad(self.payload(text=text)),
                                   "002", "text")
+
+    def test_long_single_words_are_valid_text(self):
+        # Only hex strings look like image hashes; long words and product names do not.
+        for text in ("Internationalization", "Summer2024Collection", "SupercalifragilisticXP",
+                     "a1b2c3d4e5f6a1b"):
+            with self.subTest(text=text):
+                ad_id = self.publish_ok(self.payload(text=text))
+                self.assertEqual(self.publish.get_ads(ad_id, "text"), {"text": text})
+        # Upload and URL hashes are 32 hex digits; one seeded hash is 34.
+        upload_hash = hashlib.sha256(b"PNG").hexdigest()[:32]
+        for text in ("a1b2c3d4e5f6a1b2", "DEADBEEFDEADBEEF", "0" * 64, upload_hash,
+                     self.seeded[2]["hash"]):
+            with self.subTest(text=text):
+                self.assert_error(self.publish.publish_ad(self.payload(text=text)), "002", "text")
 
     def test_read_returns_none_for_invalid_id(self):
         for ad_id in (999888777, "invalid", None, True):
@@ -161,6 +194,21 @@ class AdsStackTests(unittest.TestCase):
         self.assertEqual(self.stored_image_files(), [])
         self.assertEqual(len([image for image in self.image_store.list_images()
                               if image["hash"] == expected]), 1)
+
+    def test_concurrent_registry_writes_keep_every_image(self):
+        code = ("import image_store, sys; "
+                "[image_store.store_image(f'https://cdn.example.com/p{sys.argv[1]}_{i}.jpg') "
+                "for i in range(5)]")
+        env = dict(os.environ, PYTHONPATH=str(BASE_DIR), PYTHONDONTWRITEBYTECODE="1")
+        processes = [subprocess.Popen([sys.executable, "-c", code, str(n)], env=env,
+                                      cwd=self.data_dir, stderr=subprocess.PIPE, text=True)
+                     for n in range(8)]
+        for process in processes:
+            _, err = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, err)
+        urls = {image["url"] for image in self.image_store.list_images()}
+        self.assertEqual({f"https://cdn.example.com/p{n}_{i}.jpg" for n in range(8) for i in range(5)}
+                         - urls, set())
 
     def test_existing_hash_requires_ownership(self):
         data = self.payload()
@@ -237,6 +285,33 @@ class AdsStackTests(unittest.TestCase):
         storage.store_image.assert_not_called()
         self.assertIsNone(repository.get_ad(1))
 
+    def test_service_image_storage_is_shared_with_default_publisher(self):
+        class MemoryStorage:
+            def __init__(self):
+                self.images = {}
+                self.inputs = []
+
+            def store_image(self, image_input):
+                self.inputs.append(image_input)
+                image_hash = "f" * 32
+                self.images[image_hash] = {"hash": image_hash}
+                return self.images[image_hash]
+
+            def get_image_by_hash(self, image_hash):
+                return self.images.get(image_hash)
+
+        storage = MemoryStorage()
+        service = self.object_service(image_storage=storage)
+        image_hash = service.upload_image({"owner_id": 1, "access_token": self.token,
+                                           "file": self.video_file("photo.png", b"PNG")})
+        ad = service.publish_ad({"creator_id": 1, "access_token": self.token,
+                                 "text": VALID_TEXT, "image_hash": image_hash})
+        self.assertEqual(service.get_ad(ad.id).image_hash, "f" * 32)
+        # Link ingestion through the default publisher uses the same storage.
+        service.publish_ad(self.payload(image=NEW_URL))
+        self.assertEqual(storage.inputs[-1], NEW_URL)
+        self.assertEqual(self.image_store.list_images(), self.seeded)
+
     def test_custom_image_storage_and_clock(self):
         repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
         storage = Mock()
@@ -251,7 +326,67 @@ class AdsStackTests(unittest.TestCase):
         storage.store_image.assert_called_once_with(NEW_URL)
         # The ingested image is owned from the injected clock's time.
         images, _ = service.list_images(1, self.token)
-        self.assertIn(self.models.Image("f" * 32, 1, 1234567890), images)
+        self.assertIn(self.models.Image("f" * 32, 1, 1234567890, width=1080, height=1080), images)
+
+    def test_publish_reads_the_clock_once(self):
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        readings = iter(range(1000, 1010))
+        reads = []
+
+        def clock():
+            reads.append(1)
+            return next(readings)
+
+        publisher = self.publishing.AdPublisher(repository, clock=clock)
+        ad = publisher.publish(self.payload(image=NEW_URL))
+        self.assertEqual(len(reads), 1)
+        # The ingested image's ownership and the ad share the one reading.
+        image, = self.service.AdsService(repository).list_images(1, self.token)[0]
+        self.assertEqual((ad.creation_time, image.creation_time), (1000, 1000))
+        # A stage called without publish() reads the clock itself.
+        direct = publisher.persist(self.models.AdDraft(1, VALID_TEXT, image_hash=image.hash))
+        self.assertEqual(direct.creation_time, 1001)
+
+    def test_service_clock_times_uploads_and_ads(self):
+        service = self.object_service(clock=lambda: 1234)
+        service.upload_image({"owner_id": 1, "access_token": self.token,
+                              "file": self.video_file("photo.png", b"PNG")})
+        video = service.upload_video(self.video_payload())
+        ad = service.publish_ad(self.payload(image=NEW_URL))
+        self.assertEqual([image.creation_time for image in service.list_images(1, self.token)[0]],
+                         [1234, 1234])
+        self.assertEqual((video.upload_time, ad.creation_time), (1234, 1234))
+
+    def test_custom_upload_validators_run_before_storage(self):
+        ValidationError = self.validation.ValidationError
+
+        class SmallImages(self.validation.UploadValidator):
+            def validate_file(self, value):
+                path = super().validate_file(value)
+                if os.path.getsize(path) > 4:
+                    raise ValidationError("002", "file")
+                return path
+
+        class NamedVideos(self.validation.VideoValidator):
+            def validate(self, data):
+                owner_id, name, path = super().validate(data)
+                if not name.startswith("Launch"):
+                    raise ValidationError("002", "name")
+                return owner_id, name, path
+
+        repository = self.video_repository()
+        service = self.object_service(upload_validator=SmallImages(repository),
+                                      video_validator=NamedVideos(repository))
+        upload = {"owner_id": 1, "access_token": self.token}
+        with self.assertRaises(self.validation.ValidationError):
+            service.upload_image({**upload, "file": self.video_file("big.png", b"TOO BIG")})
+        self.assertEqual(self.stored_image_files(), [])
+        self.assertIn(service.upload_image({**upload, "file": self.video_file("ok.png", b"OK")}),
+                      self.listed_images())
+        with self.assertRaises(self.validation.ValidationError):
+            service.upload_video(self.video_payload(name="Teaser"))
+        self.assertEqual(service.upload_video(self.video_payload()).name, "Launch teaser")
+        self.assertEqual(len(list(self.video_store.VIDEO_DIR.iterdir())), 1)
 
     def test_custom_publish_stage(self):
         from dataclasses import replace
@@ -273,15 +408,15 @@ class AdsStackTests(unittest.TestCase):
         publisher = self.publishing.AdPublisher(repository, image_storage=storage)
         with self.assertRaises(self.validation.ValidationError) as caught:
             publisher.publish(self.payload(image=NEW_URL))
-        self.assert_error(caught.exception.to_dict(), "002", "image")
+        self.assert_error(caught.exception.to_dict(), "003", "image")
         self.assertIsNone(repository.get_ad(1))
 
-    def test_existing_sqlite_records_remain_readable(self):
+    def legacy_db(self):
+        """Build a pre-video, pre-token DB independently of the repository's schema."""
         import sqlite3
 
-        # Build a legacy DB independently, without the new repository's schema.
         legacy_path = self.data_dir / "legacy.db"
-        with sqlite3.connect(legacy_path) as conn:
+        with closing(sqlite3.connect(legacy_path)) as conn, conn:
             conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT)")
             conn.execute("INSERT INTO accounts VALUES (1, 'Legacy Advertiser')")
             conn.execute("CREATE TABLE ads (id INTEGER PRIMARY KEY, system_name TEXT, "
@@ -291,6 +426,10 @@ class AdsStackTests(unittest.TestCase):
                 "creation_time) VALUES (?, ?, ?, ?, ?, ?)",
                 (7, "ad_7", self.seeded[0]["hash"], VALID_TEXT, 1, 1234567890),
             )
+        return legacy_path
+
+    def test_existing_sqlite_records_remain_readable(self):
+        legacy_path = self.legacy_db()
         repository = self.repository.SQLiteAdsRepository(legacy_path)
         service = self.service.AdsService(repository)
         self.assertEqual(service.get_account(1).name, "Legacy Advertiser")
@@ -367,6 +506,25 @@ class AdsStackTests(unittest.TestCase):
                 self.assertIsNone(self.object_service().get_account(value))
                 self.assertIsNone(self.object_service().get_ad(value))
 
+    def test_ids_must_fit_sqlite_and_be_non_negative(self):
+        for value in (-5, -1, 2**63, 2**64):
+            with self.subTest(value=value):
+                self.assert_error(self.publish.create_account(value, "Advertiser"),
+                                  "002", "account_id")
+                self.assertIsNone(self.publish.get_account(value))
+                self.assertIsNone(self.publish.get_ads(value))
+                self.assert_error(self.publish.publish_ad(self.payload(creator_id=value)),
+                                  "002", "creator_id")
+                self.assert_error(self.publish.list_videos(value, self.token), "002", "owner_id")
+        self.assertEqual(set(self.publish.create_account(2**63 - 1, "Max")), {"id", "access_token"})
+        self.assertEqual(self.publish.get_account(2**63 - 1), {"id": 2**63 - 1, "name": "Max"})
+        self.assertEqual(self.publish.list_videos(1, self.token, since=0), {"data": [], "next_cursor": None})
+        # The cursor and time parsers rely on coerce_id for these bounds.
+        self.assert_error(self.publish.list_videos(1, self.token, since=-1), "002", "since")
+        self.assert_error(self.publish.list_videos(1, self.token, cursor=f"{2**63}:1"), "002", "cursor")
+        self.assert_error(self.publish.list_images(1, self.token, cursor=f"{2**63}:{'a' * 32}"),
+                          "002", "cursor")
+
     def test_projection_variants_and_invalid_types(self):
         ad_id = self.publish_ok()
         full = self.publish.get_ad(ad_id)
@@ -378,6 +536,16 @@ class AdsStackTests(unittest.TestCase):
                 self.assertEqual(self.publish.get_ads(ad_id, fields), {"text": VALID_TEXT})
         self.assertEqual(self.publish.get_ads(ad_id, ["text", "image_hash"]),
                          {"text": VALID_TEXT, "image_hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"})
+        # A string may name several comma-separated fields, as Graph API requests do.
+        for fields in ("text,image_hash", "text, image_hash", " text ,image_hash "):
+            with self.subTest(fields=fields):
+                self.assertEqual(self.publish.get_ads(ad_id, fields),
+                                 {"text": VALID_TEXT,
+                                  "image_hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"})
+        self.assertEqual(self.publish.get_ads(ad_id, "text,text"), {"text": VALID_TEXT})
+        for fields, field in (("text,", ""), ("text,unknown", "unknown"), ("", "")):
+            with self.subTest(fields=fields):
+                self.assert_error(self.publish.get_ads(ad_id, fields), "001", field)
         for fields in (123, {"text": True}, True):
             with self.subTest(fields=fields):
                 self.assert_error(self.publish.get_ads(ad_id, fields), "002", "fields")
@@ -408,7 +576,8 @@ class AdsStackTests(unittest.TestCase):
                 publisher = self.publishing.AdPublisher(repository, image_storage=storage)
                 with self.assertRaises(self.validation.ValidationError) as caught:
                     publisher.publish(self.payload(image=NEW_URL))
-                self.assertEqual(caught.exception.field, "image")
+                # A malformed handle is a storage fault, not bad input.
+                self.assertEqual((caught.exception.code, caught.exception.field), ("003", "image"))
                 self.assertIsNone(repository.get_ad(1))
 
     def test_real_image_registry_write_failure_rejected(self):
@@ -420,7 +589,7 @@ class AdsStackTests(unittest.TestCase):
 
         with patch.object(self.image_store.os, "replace", side_effect=fail_registry_replace):
             self.assert_error(self.publish.publish_ad(self.payload(image=NEW_URL)),
-                              "002", "image")
+                              "003", "image")
         self.assertIsNone(self.publish.get_ad(1))
         self.assertIsNone(self.image_store.get_image_by_url(NEW_URL))
         self.assertEqual(list(Path(self.image_store._PERSIST_DIR).glob("*.tmp")), [])
@@ -436,7 +605,7 @@ class AdsStackTests(unittest.TestCase):
 
         with patch.object(self.image_store.json, "dump", side_effect=partial_dump):
             self.assert_error(self.publish.publish_ad(self.payload(image=NEW_URL)),
-                              "002", "image")
+                              "003", "image")
         self.assertEqual(registry.read_bytes(), before)
         self.assertEqual(list(Path(self.image_store._PERSIST_DIR).glob("*.tmp")), [])
         data = self.payload(image_hash=uploaded)
@@ -458,12 +627,31 @@ class AdsStackTests(unittest.TestCase):
         with self.assertRaises(OSError):
             service.publish_ad(data)
         with patch.object(self.publish, "_service", return_value=service):
-            self.assert_error(self.publish.create_account(2, "Advertiser"), "002", "account")
-            self.assert_error(self.publish.publish_ad(data), "002", "data")
+            self.assert_error(self.publish.create_account(2, "Advertiser"), "003", "account")
+            self.assert_error(self.publish.publish_ad(data), "003", "ad")
             repository.get_account.side_effect = OSError("DB unavailable")
             repository.get_ad.side_effect = OSError("DB unavailable")
-            self.assertIsNone(self.publish.get_account(1))
-            self.assertIsNone(self.publish.get_ad(1))
+            self.assert_error(self.publish.get_account(1), "003", "account")
+            self.assert_error(self.publish.get_ad(1), "003", "ad")
+
+    def test_storage_failures_return_003_and_missing_records_none(self):
+        import sqlite3
+
+        upload = {"owner_id": 1, "access_token": self.token,
+                  "file": self.video_file("photo.png", b"PNG")}
+        unavailable = patch.object(self.repository.SQLiteAdsRepository, "_connect",
+                                   side_effect=sqlite3.OperationalError("disk I/O error"))
+        with unavailable:
+            # Reads report the failure instead of claiming the record is missing.
+            self.assert_error(self.publish.get_account(1), "003", "account")
+            self.assert_error(self.publish.get_ads(1), "003", "ad")
+            self.assert_error(self.publish.create_account(5, "Advertiser"), "003", "account")
+            # Lookups during validation still reject the write, as storage failures.
+            self.assert_error(self.publish.publish_ad(self.payload()), "003", "creator_id")
+            self.assert_error(self.publish.upload_image(upload), "003", "owner_id")
+            self.assert_error(self.publish.list_videos(1, self.token), "003", "owner_id")
+        self.assertIsNone(self.publish.get_ads(999))
+        self.assertIsNone(self.publish.get_account(999))
 
     def test_repository_rolls_back_failed_insert(self):
         import sqlite3
@@ -490,6 +678,132 @@ class AdsStackTests(unittest.TestCase):
         self.assertEqual(len({ad.id for ad in ads}), 12)
         for ad in ads:
             self.assertEqual(repository.get_ad(ad.id), ad)
+
+    def test_schema_migrates_once(self):
+        import sqlite3
+
+        legacy_path = self.legacy_db()
+        repository = self.repository.SQLiteAdsRepository(legacy_path)
+        with closing(sqlite3.connect(legacy_path)) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             self.repository.SCHEMA_VERSION)
+        statements = []
+        real_connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        # Once migrated, calls and new repositories run no schema statements or write locks.
+        with patch.object(self.repository.sqlite3, "connect", traced_connect):
+            self.assertEqual(repository.get_account(1).name, "Legacy Advertiser")
+            self.assertEqual(self.repository.SQLiteAdsRepository(legacy_path).get_ad(7).id, 7)
+        self.assertTrue(statements)
+        self.assertEqual([statement for statement in statements
+                          if statement.split()[0].upper() in {"CREATE", "ALTER", "BEGIN"}
+                          or "table_info" in statement], [])
+
+    def v1_db(self):
+        """A database migrated to schema 1, before the ad listing index."""
+        import sqlite3
+
+        path = self.data_dir / "v1.db"
+        self.repository.SQLiteAdsRepository(path)
+        with closing(sqlite3.connect(path)) as conn, conn:
+            conn.execute("DROP INDEX IF EXISTS ads_by_creator_time")
+            conn.execute("PRAGMA user_version = 1")
+        return path
+
+    def test_schema_v2_indexes_ads_by_creator(self):
+        import sqlite3
+
+        path = self.v1_db()
+        self.repository.SQLiteAdsRepository(path)
+        with closing(sqlite3.connect(path)) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            plan = conn.execute("EXPLAIN QUERY PLAN SELECT id FROM ads WHERE creator_id = 1 "
+                                "ORDER BY creation_time DESC, id DESC").fetchall()
+        self.assertIn("ads_by_creator_time", str(plan))
+        # The index also orders the page; no separate sort.
+        self.assertNotIn("TEMP B-TREE", str(plan))
+
+    def test_concurrent_migrators_run_each_step_once(self):
+        from threading import Barrier, Thread
+
+        path = self.v1_db()
+        cls = self.repository.SQLiteAdsRepository
+        original, calls, errors, start = cls._create_v2, [], [], Barrier(4)
+
+        def counting(repository, conn):
+            calls.append(1)
+            original(repository, conn)
+
+        def construct():
+            try:
+                start.wait()
+                cls(path)
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(cls, "_create_v2", counting):
+            threads = [Thread(target=construct) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+        self.assertEqual([thread.is_alive() for thread in threads], [False] * 4)
+        self.assertEqual((errors, len(calls)), ([], 1))
+
+    def test_unversioned_image_owners_tables_are_repaired(self):
+        import sqlite3
+
+        # Shapes left by earlier unversioned builds: no image_name, or neither column.
+        for columns in ("owner_id INTEGER, image_hash TEXT",
+                        "owner_id INTEGER, image_hash TEXT, creation_time INTEGER"):
+            with self.subTest(columns=columns):
+                (self.data_dir / "legacy.db").unlink(missing_ok=True)
+                path = self.legacy_db()
+                with closing(sqlite3.connect(path)) as conn, conn:
+                    conn.execute(f"CREATE TABLE image_owners ({columns}, "
+                                 "PRIMARY KEY (owner_id, image_hash))")
+                    conn.execute("INSERT INTO image_owners (owner_id, image_hash) VALUES (1, ?)",
+                                 ("a" * 32,))
+                repository = self.repository.SQLiteAdsRepository(path)
+                # Rows without a recorded time read back as 0 (unknown), never NULL.
+                self.assertEqual(repository.list_images(1, 10),
+                                 [self.models.Image("a" * 32, 1, 0, None)])
+                self.assertTrue(repository.grant_image(1, "b" * 32, 1234567890, "Hero"))
+                self.assertEqual(repository.get_image_hash_by_name(1, "Hero"), "b" * 32)
+                # A page boundary just before the unknown-time row still reaches it.
+                self.assertEqual(repository.list_images(1, 10, after=(1234567890, "b" * 32)),
+                                 [self.models.Image("a" * 32, 1, 0, None)])
+
+    def test_concurrent_processes_migrate_legacy_db(self):
+        legacy_path = self.legacy_db()
+        code = ("import json, repository; "
+                f"r = repository.SQLiteAdsRepository({str(legacy_path)!r}); "
+                "print(json.dumps(r.get_ad(7).to_dict()))")
+        env = dict(os.environ, PYTHONPATH=str(BASE_DIR), PYTHONDONTWRITEBYTECODE="1")
+        processes = [subprocess.Popen([sys.executable, "-c", code], env=env, cwd=self.data_dir,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                     for _ in range(4)]
+        for process in processes:
+            out, err = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 0, err)
+            self.assertIsNone(json.loads(out)["video_id"])
+
+    def test_migrated_db_readable_while_a_writer_holds_the_lock(self):
+        import sqlite3
+
+        with closing(sqlite3.connect(self.publish.DB_PATH, isolation_level=None)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            try:
+                # Reads build a new repository per call; they must not queue behind writers.
+                account = self.publish.get_account(1)
+            finally:
+                writer.execute("ROLLBACK")
+        self.assertEqual(account, {"id": 1, "name": "Advertiser One"})
 
     def video_file(self, name="clip.mp4", content=b"FAKE_VIDEO_BYTES"):
         path = self.data_dir / "uploads" / name
@@ -568,7 +882,7 @@ class AdsStackTests(unittest.TestCase):
         service = self.service.AdsService(self.video_repository(), video_storage=storage)
         with self.assertRaises(self.validation.ValidationError) as caught:
             service.upload_video(self.video_payload())
-        self.assert_error(caught.exception.to_dict(), "002", "file")
+        self.assert_error(caught.exception.to_dict(), "003", "file")
         self.assertIsNone(self.video_repository().get_video(1))
 
     def test_failed_copy_leaves_no_partial_video(self):
@@ -576,7 +890,7 @@ class AdsStackTests(unittest.TestCase):
         digest = Mock()
         digest.update.side_effect = RuntimeError("Read failed")
         with patch.object(self.file_store, "hashlib", Mock(sha256=Mock(return_value=digest))):
-            self.assert_error(self.publish.upload_video(self.video_payload()), "002", "file")
+            self.assert_error(self.publish.upload_video(self.video_payload()), "003", "file")
         self.assertEqual(list(self.video_store.VIDEO_DIR.iterdir()), [])
 
     def test_rename_video_changes_only_name(self):
@@ -597,6 +911,33 @@ class AdsStackTests(unittest.TestCase):
                 self.assert_error(self.publish.rename_video(video_id_value, name, token), "002", field)
         self.assertEqual(self.video_repository().get_video(video_id).name, "Final cut")
 
+    def test_get_video_returns_the_owners_video(self):
+        video_id = self.publish.upload_video(self.video_payload())["id"]
+        video = self.publish.get_video(video_id, self.token)
+        self.assertEqual(video, self.video_repository().get_video(video_id).to_dict())
+        self.assertEqual(video["name"], "Launch teaser")
+        self.assertEqual(self.object_service().get_video(str(video_id), self.token).id, video_id)
+        # Missing videos, bad IDs, and wrong tokens look the same, so IDs cannot be probed.
+        other_token = self.create_account(2, "Advertiser Two")
+        for vid, token in ((video_id + 1, self.token), ("x", self.token), (-1, self.token),
+                           (video_id, None), (video_id, "wrong"), (video_id, other_token)):
+            with self.subTest(video_id=vid, token=token):
+                self.assert_error(self.publish.get_video(vid, token), "002", "video_id")
+        for method in ("get_video", "get_token_hash"):
+            with self.subTest(failing=method):
+                repository = self.video_repository()
+                with patch.object(repository, method, side_effect=OSError("DB unavailable")):
+                    with patch.object(self.publish, "_service",
+                                      return_value=self.service.AdsService(repository)):
+                        self.assert_error(self.publish.get_video(video_id, self.token),
+                                          "003", "video")
+                    # The object API raises StorageError for either lookup, as documented.
+                    for call in (lambda service: service.get_video(video_id, self.token),
+                                 lambda service: service.rename_video(video_id, "New", self.token)):
+                        with self.assertRaises(self.validation.StorageError) as caught:
+                            call(self.service.AdsService(repository))
+                        self.assertEqual(caught.exception.field, "video")
+
     def seed_videos(self, upload_times, owner_id=1):
         repository = self.video_repository()
         return [repository.save_video(owner_id, f"Video {i}", "a" * 32, upload_time).to_dict()
@@ -606,7 +947,7 @@ class AdsStackTests(unittest.TestCase):
         pages, cursor = [], None
         # Bounded so a cursor that never ends fails instead of hanging.
         for _ in range(50):
-            page = self.publish.list_videos(1, cursor=cursor, **kwargs)
+            page = self.publish.list_videos(1, self.token, cursor=cursor, **kwargs)
             self.assertEqual(set(page), {"data", "next_cursor"}, page)
             pages.append(page["data"])
             cursor = page["next_cursor"]
@@ -623,14 +964,14 @@ class AdsStackTests(unittest.TestCase):
         pages = self.list_all_pages(limit=2)
         self.assertEqual([len(page) for page in pages], [2, 2, 1])
         self.assertEqual([video for page in pages for video in page], expected)
-        self.assertEqual(self.publish.list_videos(1, limit="5"),
+        self.assertEqual(self.publish.list_videos(1, self.token, limit="5"),
                          {"data": expected, "next_cursor": None})
 
     def test_list_videos_default_page_size(self):
         videos = self.seed_videos(range(26))
-        first = self.publish.list_videos(1)
+        first = self.publish.list_videos(1, self.token)
         self.assertEqual(first["data"], videos[:0:-1])
-        second = self.publish.list_videos(1, cursor=first["next_cursor"])
+        second = self.publish.list_videos(1, self.token, cursor=first["next_cursor"])
         self.assertEqual(second, {"data": [videos[0]], "next_cursor": None})
 
     def test_list_videos_filters_by_upload_time(self):
@@ -639,21 +980,21 @@ class AdsStackTests(unittest.TestCase):
         pages = self.list_all_pages(limit=1, since=200, until="400")
         self.assertEqual([video for page in pages for video in page],
                          [videos[3], videos[2], videos[1]])
-        self.assertEqual(self.publish.list_videos(1, since=401)["data"], [])
-        self.assertEqual(self.publish.list_videos(1, since=300, until=300)["data"], [])
-        self.assertEqual(self.publish.list_videos(1, until=101)["data"], [videos[0]])
+        self.assertEqual(self.publish.list_videos(1, self.token, since=401)["data"], [])
+        self.assertEqual(self.publish.list_videos(1, self.token, since=300, until=300)["data"], [])
+        self.assertEqual(self.publish.list_videos(1, self.token, until=101)["data"], [videos[0]])
 
     def test_list_videos_pages_stable_across_new_uploads(self):
         videos = self.seed_videos([100, 200, 300])
-        first = self.publish.list_videos(1, limit=2)
+        first = self.publish.list_videos(1, self.token, limit=2)
         self.seed_videos([500])
-        second = self.publish.list_videos(1, limit=2, cursor=first["next_cursor"])
+        second = self.publish.list_videos(1, self.token, limit=2, cursor=first["next_cursor"])
         self.assertEqual(first["data"] + second["data"], [videos[2], videos[1], videos[0]])
 
     def test_list_videos_empty_and_object_api(self):
-        self.assertEqual(self.publish.list_videos(1), {"data": [], "next_cursor": None})
+        self.assertEqual(self.publish.list_videos(1, self.token), {"data": [], "next_cursor": None})
         uploaded = self.service.AdsService(self.video_repository()).upload_video(self.video_payload())
-        videos, next_cursor = self.object_service().list_videos(1)
+        videos, next_cursor = self.object_service().list_videos(1, self.token)
         self.assertEqual((videos, next_cursor), ([uploaded], None))
         self.assertIsInstance(videos[0], self.models.Video)
 
@@ -667,18 +1008,72 @@ class AdsStackTests(unittest.TestCase):
             cases += [({field: value}, field) for value in (-1, "x", True, 1.5, 2**63)]
         for kwargs, field in cases:
             with self.subTest(kwargs=kwargs):
-                kwargs = {"owner_id": 1, **kwargs}
+                kwargs = {"owner_id": 1, "access_token": self.token, **kwargs}
                 self.assert_error(self.publish.list_videos(**kwargs), "002", field)
                 with self.assertRaises(self.validation.ValidationError):
                     self.object_service().list_videos(**kwargs)
 
+    def test_list_videos_requires_owner_token(self):
+        other_token = self.create_account(2, "Advertiser Two")
+        self.seed_videos([100])
+        for token in (None, "", "wrong", 123, other_token):
+            with self.subTest(token=token):
+                self.assert_error(self.publish.list_videos(1, token), "002", "access_token")
+                with self.assertRaises(self.validation.ValidationError):
+                    self.object_service().list_videos(1, token)
+        # An account's own token lists only its own videos.
+        self.assertEqual(self.publish.list_videos(2, other_token),
+                         {"data": [], "next_cursor": None})
+        self.assertEqual(len(self.publish.list_videos(1, self.token)["data"]), 1)
+
     def test_list_videos_storage_failure(self):
         repository = Mock()
         repository.get_account.return_value = self.models.AdAccount(1, "Advertiser")
+        repository.get_token_hash.return_value = self.validation.hash_token(self.token)
         repository.list_videos.side_effect = OSError("DB unavailable")
         with patch.object(self.publish, "_service",
                           return_value=self.service.AdsService(repository)):
-            self.assert_error(self.publish.list_videos(1), "002", "videos")
+            self.assert_error(self.publish.list_videos(1, self.token), "003", "video")
+
+    def seed_ads(self, creation_times, creator_id=1):
+        repository = self.video_repository()
+        draft = self.models.AdDraft(creator_id, VALID_TEXT, image_hash="a" * 32)
+        return [repository.save_ad(draft, created).to_dict() for created in creation_times]
+
+    def test_list_ads_pages_newest_first(self):
+        ads = self.seed_ads([100, 300, 300, 200])
+        self.create_account(2, "Advertiser Two")
+        self.seed_ads([250], creator_id=2)
+        # Newest first; ties by ID, descending. Ads are public, so no token is needed.
+        expected = [ads[2], ads[1], ads[3], ads[0]]
+        first = self.publish.list_ads(1, limit=2)
+        self.assertEqual(first["data"], expected[:2])
+        self.assertEqual(self.publish.list_ads(1, since=200, until=300)["data"], [ads[3]])
+        self.assertEqual(self.publish.list_ads("1", limit="1")["data"], [ads[2]])
+        objects, next_cursor = self.object_service().list_ads(1)
+        self.assertEqual(([ad.to_dict() for ad in objects], next_cursor), (expected, None))
+        # Ads published after the first page never shift later pages.
+        self.seed_ads([999])
+        second = self.publish.list_ads(1, limit=2, cursor=first["next_cursor"])
+        self.assertEqual(second, {"data": expected[2:], "next_cursor": None})
+        self.assertEqual(self.publish.list_ads(1, cursor=first["next_cursor"], since=150)["data"],
+                         [ads[3]])
+        self.assertEqual(self.publish.list_ads(2)["data"][0]["creator_id"], 2)
+
+    def test_list_ads_rejects_invalid_parameters(self):
+        cases = [({"creator_id": creator}, "creator_id") for creator in (999999999, None, "x", -1)]
+        cases += [({"limit": limit}, "limit") for limit in (0, 101, "x")]
+        cases += [({"cursor": cursor}, "cursor") for cursor in ("abc", "1:2:3", f"{2**63}:1")]
+        cases += [({"since": -1}, "since"), ({"until": "x"}, "until")]
+        for kwargs, field in cases:
+            with self.subTest(kwargs=kwargs):
+                self.assert_error(self.publish.list_ads(**{"creator_id": 1, **kwargs}),
+                                  "002", field)
+        repository = self.video_repository()
+        with patch.object(repository, "list_ads", side_effect=OSError("DB unavailable")):
+            with patch.object(self.publish, "_service",
+                              return_value=self.service.AdsService(repository)):
+                self.assert_error(self.publish.list_ads(1), "003", "ad")
 
     def video_ad_payload(self, video_id, **changes):
         data = {"creator_id": 1, "access_token": self.token, "text": VALID_TEXT, "video_id": video_id}
@@ -730,7 +1125,7 @@ class AdsStackTests(unittest.TestCase):
         repository.get_video.side_effect = OSError("DB unavailable")
         with self.assertRaises(self.validation.ValidationError) as caught:
             self.service.AdsService(repository).publish_ad(self.video_ad_payload(1))
-        self.assert_error(caught.exception.to_dict(), "002", "video_id")
+        self.assert_error(caught.exception.to_dict(), "003", "video_id")
         repository.save_ad.assert_not_called()
 
     def image_upload(self, **changes):
@@ -810,6 +1205,72 @@ class AdsStackTests(unittest.TestCase):
                               if image["hash"] == expected]), 1)
         self.assertIn(f"{expected}.png", self.stored_image_files())
 
+    def test_same_bytes_keep_one_stored_copy(self):
+        first = self.image_upload(file=self.video_file("a.png", b"SAME"))["hash"]
+        second = self.image_upload(file=self.video_file("b.gif", b"SAME"))["hash"]
+        self.assertEqual(first, second)
+        self.assertEqual(self.stored_image_files(), [f"{first}.png"])
+        stored = Path(self.image_store.get_image_by_hash(first)["path"])
+        self.assertEqual(stored.read_bytes(), b"SAME")
+        # Re-uploading with the same suffix, or through a symlinked directory, rewrites the
+        # registered copy itself; it must never be deleted as a duplicate.
+        self.image_upload(file=self.video_file("c.png", b"SAME"))
+        link = self.data_dir / "linked_store"
+        link.symlink_to(self.image_store._PERSIST_DIR)
+        with patch.object(self.image_store, "_PERSIST_DIR", str(link)):
+            self.image_upload(file=self.video_file("d.png", b"SAME"))
+        self.assertEqual(self.stored_image_files(), [f"{first}.png"])
+        self.assertEqual(stored.read_bytes(), b"SAME")
+
+    def test_copied_data_dir_keeps_its_copy_on_reupload(self):
+        content = b"MOVED"
+        image_hash = self.image_upload(file=self.video_file("a.png", content))["hash"]
+        # Copy the data directory elsewhere; its registry still names the old location.
+        moved = Path(tempfile.mkdtemp(prefix="ads-stack-moved-"))
+        self.addCleanup(shutil.rmtree, moved, True)
+        shutil.copytree(self.image_store._PERSIST_DIR, moved / "image_store_data")
+        with patch.multiple(self.image_store, _PERSIST_DIR=str(moved / "image_store_data"),
+                            _PERSIST_FILE=str(moved / "image_store_data/persisted_images.json"),
+                            _LOCK_FILE=str(moved / "image_registry.lock")):
+            self.image_store.store_image(self.video_file("again.png", content))
+        self.assertEqual((moved / "image_store_data" / f"{image_hash}.png").read_bytes(), content)
+
+    def test_duplicate_cleanup_failure_does_not_fail_the_upload(self):
+        registered = self.image_upload(file=self.video_file("a.gif", b"SAME"))["hash"]
+        real_store_file = self.file_store.store_file
+
+        def store_then_lose_copy(path, directory, max_bytes, suffix=""):
+            # A concurrent upload of the same bytes and suffix already removed this copy.
+            file_hash = real_store_file(path, directory, max_bytes, suffix)
+            os.unlink(os.path.join(directory, f"{file_hash}{suffix}"))
+            return file_hash
+
+        with patch.object(self.image_store.file_store, "store_file", store_then_lose_copy):
+            self.assertEqual(self.image_upload(file=self.video_file("b.png", b"SAME")),
+                             {"hash": registered})
+        self.assertEqual(self.stored_image_files(), [f"{registered}.gif"])
+
+    def test_concurrent_file_ingestion_keeps_every_image_and_one_copy(self):
+        suffixes = (".png", ".gif", ".jpg", ".jpeg", ".webp", ".bmp")
+        files = [(self.video_file(f"own{n}{suffix}", f"OWN{n}".encode()),
+                  self.video_file(f"shared{n}{suffix}", b"SHARED"))
+                 for n, suffix in enumerate(suffixes)]
+        code = "import image_store, sys; [image_store.store_image(path) for path in sys.argv[1:]]"
+        env = dict(os.environ, PYTHONPATH=str(BASE_DIR), PYTHONDONTWRITEBYTECODE="1")
+        processes = [subprocess.Popen([sys.executable, "-c", code, *pair], env=env,
+                                      cwd=self.data_dir, stderr=subprocess.PIPE, text=True)
+                     for pair in files]
+        for process in processes:
+            _, err = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, err)
+        digest = lambda content: hashlib.sha256(content).hexdigest()[:32]
+        expected = {digest(f"OWN{n}".encode()) for n in range(len(suffixes))} | {digest(b"SHARED")}
+        self.assertEqual(expected - {image["hash"] for image in self.image_store.list_images()},
+                         set())
+        shared = self.image_store.get_image_by_hash(digest(b"SHARED"))
+        self.assertEqual([name for name in self.stored_image_files()
+                          if name.startswith(digest(b"SHARED"))], [Path(shared["path"]).name])
+
     def test_upload_image_rejects_before_storing(self):
         directory = self.data_dir / "uploads" / "folder.png"
         directory.mkdir(parents=True)
@@ -826,13 +1287,109 @@ class AdsStackTests(unittest.TestCase):
         for token in (None, "wrong", 123, self.create_account(2, "Advertiser Two")):
             cases.append(({"owner_id": 1, "access_token": token,
                            "file": self.video_file("b.png")}, "002", "access_token"))
-        for file in ("", None, str(self.data_dir / "missing.png"), str(directory)):
+        # Images need an image extension; only the extension is checked.
+        not_images = [self.video_file(name) for name in ("notes.txt", "clip.mp4", "noext")]
+        for file in ("", None, str(self.data_dir / "missing.png"), str(directory), *not_images):
             cases.append(({"owner_id": 1, "access_token": self.token, "file": file},
                           "002", "file"))
         for data, code, field in cases:
             with self.subTest(data=data):
                 self.assert_error(self.publish.upload_image(data), code, field)
         self.assertEqual(self.stored_image_files(), [])
+        # Extensions match case-insensitively.
+        self.assertIn("hash", self.image_upload(file=self.video_file("UPPER.JPG", b"JPG")))
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read any file")
+    def test_unreadable_upload_source_is_invalid_not_storage_failure(self):
+        for name, upload in (("locked.png", self.image_upload), ("locked.mp4", None)):
+            with self.subTest(name=name):
+                path = Path(self.video_file(name, b"LOCKED"))
+                path.chmod(0)
+                self.addCleanup(path.chmod, 0o600)
+                response = (upload(file=str(path)) if upload
+                            else self.publish.upload_video(self.video_payload(file=str(path))))
+                self.assert_error(response, "002", "file")
+        self.assertEqual(self.stored_image_files(), [])
+        self.assertEqual(list(self.video_store.VIDEO_DIR.iterdir()), [])
+
+    def test_rename_video_storage_failure_does_not_reveal_the_video(self):
+        video_id = self.publish.upload_video(self.video_payload())["id"]
+        repository = self.video_repository()
+        with patch.object(repository, "get_token_hash", side_effect=OSError("DB unavailable")):
+            with patch.object(self.publish, "_service",
+                              return_value=self.service.AdsService(repository)):
+                # Same error as a failed video lookup, so an outage cannot confirm the ID.
+                self.assert_error(self.publish.rename_video(video_id, "New", self.token),
+                                  "003", "video")
+
+    def image_headers(self):
+        """Minimal headers per format, each declaring the given (width, height)."""
+        import struct
+
+        app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x00" * 9
+        sof0 = b"\xff\xc0" + struct.pack(">HBHH", 17, 8, 600, 800) + b"\x00" * 10
+        vp8 = (b"VP8 " + struct.pack("<I", 10) + b"\x00\x00\x00\x9d\x01\x2a"
+               + struct.pack("<HH", 400, 300))
+        vp8l = (b"VP8L" + struct.pack("<I", 5) + b"\x2f"
+                + ((1024 - 1) | (768 - 1) << 14).to_bytes(4, "little"))
+        vp8x = (b"VP8X" + struct.pack("<I", 10) + b"\x00" * 4
+                + (1200 - 1).to_bytes(3, "little") + (628 - 1).to_bytes(3, "little"))
+        riff = lambda chunk: b"RIFF" + struct.pack("<I", 4 + len(chunk)) + b"WEBP" + chunk
+        return {
+            "a.png": (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
+                      + struct.pack(">II", 640, 480) + b"\x08\x02\x00\x00\x00" + b"\x00" * 4,
+                      (640, 480)),
+            "b.gif": (b"GIF89a" + struct.pack("<HH", 320, 200) + b"\x00" * 7, (320, 200)),
+            "c.jpg": (b"\xff\xd8" + app0 + sof0 + b"\xff\xd9", (800, 600)),
+            "d.webp": (riff(vp8), (400, 300)),
+            "e.webp": (riff(vp8l), (1024, 768)),
+            "f.webp": (riff(vp8x), (1200, 628)),
+        }
+
+    def test_image_dimensions_from_headers(self):
+        for name, (content, size) in self.image_headers().items():
+            with self.subTest(name=name):
+                self.assertEqual(self.image_store.image_dimensions(self.video_file(name, content)),
+                                 size)
+        import struct
+
+        sof0 = b"\xff\xc0" + struct.pack(">HBHH", 17, 8, 600, 800) + b"\x00" * 10
+        # An APP1 payload (such as an EXIF thumbnail) is skipped even if it contains an SOF.
+        app1 = b"\xff\xe1" + struct.pack(">H", 2 + len(sof0)) + sof0.replace(b"\x02\x58", b"\x00\x01")
+        for name, content in (("fill.jpg", b"\xff\xd8\xff\xff\xff" + sof0[1:]),
+                              ("rst.jpg", b"\xff\xd8" + b"\xff\xd0" * 3 + sof0),
+                              ("app1.jpg", b"\xff\xd8" + app1 + sof0)):
+            with self.subTest(name=name):
+                self.assertEqual(self.image_store.image_dimensions(self.video_file(name, content)),
+                                 (800, 600))
+        vp8_scaled = bytearray(self.image_headers()["d.webp"][0])
+        vp8_scaled[27] |= 0xC0  # Scale bits above the 14-bit width.
+        self.assertEqual(self.image_store.image_dimensions(self.video_file("s.webp", vp8_scaled)),
+                         (400, 300))
+        # The marker walk is bounded, so a crafted file cannot make uploads slow.
+        for name, padding in (("markers.jpg", b"\xff\xd0" * 5000), ("fills.jpg", b"\xff" * 10000)):
+            with self.subTest(name=name):
+                content = b"\xff\xd8" + padding + sof0
+                self.assertIsNone(self.image_store.image_dimensions(self.video_file(name, content)))
+
+        # Unparsable content gives None, never an error: the supplied sample is text.
+        sos_first = b"\xff\xd8\xff\xda" + b"\x00" * 20
+        png = self.image_headers()["a.png"][0]
+        for name, content in (("sample.jpg", (BASE_DIR / "file_handle_store/sample.jpg").read_bytes()),
+                              ("short.png", png[:20]), ("sos.jpg", sos_first),
+                              ("cut.jpg", b"\xff\xd8\xff\xe0\x00"), ("empty.gif", b""),
+                              ("riff.webp", b"RIFF\x00\x00\x00\x00WEBPVP8 ")):
+            with self.subTest(name=name):
+                self.assertIsNone(self.image_store.image_dimensions(self.video_file(name, content)))
+
+    def test_upload_records_image_dimensions(self):
+        content, size = self.image_headers()["c.jpg"]
+        image_hash = self.image_upload(file=self.video_file("photo.jpg", content))["hash"]
+        entry = self.image_store.get_image_by_hash(image_hash)
+        self.assertEqual((entry["width"], entry["height"]), size)
+        unknown = self.image_upload(file=self.video_file("text.png", b"not an image"))["hash"]
+        entry = self.image_store.get_image_by_hash(unknown)
+        self.assertEqual((entry["width"], entry["height"]), (None, None))
 
     def test_image_and_video_size_limits(self):
         # Images: the real 30 MiB limit, exactly at and one byte over it.
@@ -862,8 +1419,10 @@ class AdsStackTests(unittest.TestCase):
         for i, creation_time in enumerate(creation_times):
             image_hash = "abcdefghij"[i] * 32
             repository.grant_image(owner_id, image_hash, creation_time)
+            # Not in image storage and created before the cutoff: placeholder dimensions.
             images.append({"hash": image_hash, "owner_id": owner_id,
-                           "creation_time": creation_time, "image_name": None})
+                           "creation_time": creation_time, "image_name": None,
+                           "image_url": None, "width": 1080, "height": 1080})
         return images
 
     def list_all_image_pages(self, **kwargs):
@@ -937,6 +1496,78 @@ class AdsStackTests(unittest.TestCase):
             self.assertEqual(self.image_upload(), {"hash": uploaded})
         self.assertEqual(self.object_service().list_images(1, self.token)[0], images)
 
+    def test_list_images_reports_url_and_dimensions(self):
+        cutoff = self.service.DIMENSIONS_CUTOFF
+        png, png_size = self.image_headers()["a.png"]
+        link = self.seeded[1]  # Seeded with real dimensions, 1200x628.
+        for created, unknown in ((cutoff - 1, (1080, 1080)), (cutoff, (None, None))):
+            with self.subTest(created=created):
+                (self.data_dir / "ads.db").unlink(missing_ok=True)
+                self.token = self.create_account(1, "Advertiser One")
+                service = self.object_service(clock=lambda: created)
+                service.publish_ad(self.payload(image=link["url"]))
+                service.publish_ad(self.payload(image=NEW_URL))  # Link ingest: no size known.
+                upload = {"owner_id": 1, "access_token": self.token}
+                parsed = service.upload_image({**upload, "file": self.video_file("a.png", png)})
+                text = service.upload_image({**upload, "file": self.video_file("t.png", b"TEXT")})
+                described = {h: (i["image_url"], i["width"], i["height"])
+                             for h, i in self.listed_images().items()}
+                # Stored sizes always win; a missing size is a placeholder only for images
+                # created before dimensions were recorded.
+                self.assertEqual(described, {
+                    link["hash"]: (link["url"], 1200, 628),
+                    self.image_store.get_image_by_url(NEW_URL)["hash"]: (NEW_URL, *unknown),
+                    parsed: (None, *png_size),
+                    text: (None, *unknown),
+                })
+
+    def test_reupload_records_size_for_entries_stored_before_sizes(self):
+        content, size = self.image_headers()["a.png"]
+        image_hash = hashlib.sha256(content).hexdigest()[:32]
+        stored = Path(self.image_store._PERSIST_DIR) / f"{image_hash}.png"
+        stored.write_bytes(content)
+        gif, _ = self.image_headers()["b.gif"]
+        gif_hash = hashlib.sha256(gif).hexdigest()[:32]
+        # A registry entry written before uploads recorded sizes, and one that has a size.
+        Path(self.image_store._PERSIST_FILE).write_text(json.dumps([
+            {"id": f"img_{image_hash[:8]}", "url": None, "hash": image_hash,
+             "path": str(stored), "original_path": str(stored), "source": "file_handle"},
+            {"id": f"img_{gif_hash[:8]}", "url": None, "hash": gif_hash, "path": str(stored),
+             "original_path": str(stored), "source": "file_handle", "width": 1, "height": 1}]))
+        service = self.object_service(clock=lambda: self.service.DIMENSIONS_CUTOFF + 1)
+        service.upload_image({"owner_id": 1, "access_token": self.token,
+                              "file": self.video_file("again.png", content)})
+        entry = self.image_store.get_image_by_hash(image_hash)
+        self.assertEqual((entry.get("width"), entry.get("height")), size)
+        image, = service.list_images(1, self.token)[0]
+        self.assertEqual((image.width, image.height), size)
+        # A recorded size is never replaced.
+        service.upload_image({"owner_id": 1, "access_token": self.token,
+                              "file": self.video_file("b.gif", gif)})
+        entry = self.image_store.get_image_by_hash(gif_hash)
+        self.assertEqual((entry["width"], entry["height"]), (1, 1))
+
+    def test_entries_from_before_size_tracking_get_placeholder_after_cutoff(self):
+        # The old code kept running past the cutoff: its file entries have no size keys.
+        image_hash = "c" * 32
+        Path(self.image_store._PERSIST_FILE).write_text(json.dumps([{
+            "id": "img_cccccccc", "url": None, "hash": image_hash, "path": "/old/c.png",
+            "original_path": "/old/c.png", "source": "file_handle"}]))
+        self.video_repository().grant_image(1, image_hash, self.service.DIMENSIONS_CUTOFF + 60)
+        image, = self.object_service().list_images(1, self.token)[0]
+        self.assertEqual((image.width, image.height), (1080, 1080))
+
+    def test_list_images_description_failures(self):
+        self.object_service(clock=lambda: self.service.DIMENSIONS_CUTOFF - 1).upload_image(
+            {"owner_id": 1, "access_token": self.token, "file": self.video_file("a.png", b"PNG")})
+        with patch.object(self.image_store, "get_image_by_hash", side_effect=OSError("down")):
+            self.assert_error(self.publish.list_images(1, self.token), "003", "image")
+        # Storage that returns no usable record gives unknown details, not an error.
+        storage = Mock()
+        storage.get_image_by_hash.return_value = None
+        images, _ = self.object_service(image_storage=storage).list_images(1, self.token)
+        self.assertEqual([(image.image_url, image.width) for image in images], [(None, 1080)])
+
     def test_list_images_rejects_invalid_parameters(self):
         self.seed_images([100])
         valid_hash = "a" * 32
@@ -960,7 +1591,7 @@ class AdsStackTests(unittest.TestCase):
         repository.list_images.side_effect = OSError("DB unavailable")
         with patch.object(self.publish, "_service",
                           return_value=self.service.AdsService(repository)):
-            self.assert_error(self.publish.list_images(1, self.token), "002", "images")
+            self.assert_error(self.publish.list_images(1, self.token), "003", "image")
 
     def test_publish_rejects_hashes_missing_from_image_store(self):
         data = self.payload(image_hash="f" * 32)
@@ -974,7 +1605,7 @@ class AdsStackTests(unittest.TestCase):
         with patch.object(self.image_store, "get_image_by_hash", return_value=None):
             self.assert_error(self.publish.publish_ad(data), "002", "image_hash")
         with patch.object(self.image_store, "get_image_by_hash", side_effect=OSError("down")):
-            self.assert_error(self.publish.publish_ad(data), "002", "image_hash")
+            self.assert_error(self.publish.publish_ad(data), "003", "image_hash")
         self.assertIsNone(self.publish.get_ad(1))
         self.publish_ok(data)
 
@@ -995,7 +1626,7 @@ class AdsStackTests(unittest.TestCase):
 
     def test_uploaded_hashes_publish_unchanged(self):
         hashes = []
-        for name, content in (("a.png", b"PNG"), ("b.jpg", b"JPEG"), ("noext", b"RAW"),
+        for name, content in (("a.png", b"PNG"), ("b.jpg", b"JPEG"), ("c.webp", b"RAW"),
                               ("empty.gif", b"")):
             with self.subTest(name=name):
                 image_hash = self.image_upload(file=self.video_file(name, content))["hash"]
@@ -1031,12 +1662,12 @@ class AdsStackTests(unittest.TestCase):
             with self.subTest(damaged=damaged):
                 registry.write_text(damaged)
                 self.assert_error(self.image_upload(file=self.video_file("new.png", b"NEW")),
-                                  "002", "file")
+                                  "003", "file")
                 self.assert_error(self.publish.publish_ad(self.payload(image=NEW_URL)),
-                                  "002", "image")
+                                  "003", "image")
                 data = self.payload(image_hash=uploaded)
                 del data["image"]
-                self.assert_error(self.publish.publish_ad(data), "002", "image_hash")
+                self.assert_error(self.publish.publish_ad(data), "003", "image_hash")
                 self.assertEqual(registry.read_text(), damaged)
         self.assertIsNone(self.publish.get_ad(1))
 
@@ -1052,7 +1683,8 @@ class AdsStackTests(unittest.TestCase):
         self.assertEqual(images[named]["image_name"], "Spring hero")
         self.assertIsNone(images[unnamed]["image_name"])
         self.assertIsNone(images[ingested]["image_name"])
-        self.assertEqual(set(images[named]), {"hash", "owner_id", "creation_time", "image_name"})
+        self.assertEqual(set(images[named]), {"hash", "owner_id", "creation_time", "image_name",
+                                              "image_url", "width", "height"})
         fresh = self.fresh_process(
             f"import json, publish; print(json.dumps(publish.list_images(1, {self.token!r})))")
         self.assertIn(images[named], fresh["data"])
@@ -1062,9 +1694,10 @@ class AdsStackTests(unittest.TestCase):
         created = self.listed_images()[image_hash]["creation_time"]
         with patch.object(self.service.time, "time", return_value=created + 1000):
             self.image_upload(image_name="Second")
-            self.assertEqual(self.listed_images()[image_hash],
-                             {"hash": image_hash, "owner_id": 1, "creation_time": created,
-                              "image_name": "Second"})
+            ownership = {key: self.listed_images()[image_hash][key]
+                         for key in ("hash", "owner_id", "creation_time", "image_name")}
+            self.assertEqual(ownership, {"hash": image_hash, "owner_id": 1,
+                                         "creation_time": created, "image_name": "Second"})
             # Without a name, a re-upload keeps the current one.
             self.image_upload()
         self.assertEqual(self.listed_images()[image_hash]["image_name"], "Second")
@@ -1172,10 +1805,10 @@ class AdsStackTests(unittest.TestCase):
                 conn.execute(f"CREATE TRIGGER reject_{table}_{statement} BEFORE {statement} "
                              f"ON {table} BEGIN SELECT RAISE(ABORT, 'Rejected write'); END")
         # A failed ownership write is a storage failure, not a name conflict.
-        self.assert_error(self.image_upload(image_name="Hero"), "002", "data")
-        self.assert_error(self.publish.upload_video(self.video_payload()), "002", "data")
+        self.assert_error(self.image_upload(image_name="Hero"), "003", "image")
+        self.assert_error(self.publish.upload_video(self.video_payload()), "003", "video")
         self.assert_error(self.publish.rename_video(video_id, "New name", self.token),
-                          "002", "video")
+                          "003", "video")
         self.assertEqual(self.listed_images(), {})
         self.assertEqual(self.video_repository().get_video(video_id).name, "Launch teaser")
         self.assertIsNone(self.video_repository().get_video(video_id + 1))
@@ -1199,7 +1832,8 @@ class AdsStackTests(unittest.TestCase):
                 with patch.object(repository, method, side_effect=OSError("DB unavailable")):
                     with self.assertRaises(self.validation.ValidationError) as caught:
                         getattr(self.service.AdsService(repository), call)(data)
-                self.assertEqual(caught.exception.field, field)
+                self.assertEqual((caught.exception.code, caught.exception.field),
+                                 ("003", field))
         self.assertIsNone(self.publish.get_ad(1))
         self.assertEqual(list(self.listed_images()), [image_hash])
         self.assertIsNone(self.video_repository().get_video(1))

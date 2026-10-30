@@ -22,6 +22,8 @@ class AdDraft:
     image: Optional[str] = None
     image_hash: Optional[str] = None
     video_id: Optional[int] = None
+    # Set once by the publisher so every stage records the same time.
+    creation_time: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,10 @@ class Image:
     owner_id: int
     creation_time: int
     image_name: Optional[str] = None
+    # Filled from image storage when listed: the link URL, if any, and the pixel size.
+    image_url: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
 
     def to_dict(self):
         return asdict(self)

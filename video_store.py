@@ -1,13 +1,9 @@
 """Local video storage: uploaded files are copied in and addressed by content hash."""
 
-import os
-from pathlib import Path
-
+import config
 import file_store
 
-_BASE_DIR = Path(__file__).resolve().parent
-_DATA_DIR = Path(os.environ.get("ADS_STACK_DATA_DIR", str(_BASE_DIR / "data"))).expanduser().resolve()
-VIDEO_DIR = _DATA_DIR / "videos"
+VIDEO_DIR = config.DATA_DIR / "videos"
 MAX_VIDEO_BYTES = 1024 ** 3  # 1 GiB
 
 
