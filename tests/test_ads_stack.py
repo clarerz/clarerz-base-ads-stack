@@ -22,6 +22,25 @@ from unittest.mock import Mock, patch
 BASE_DIR = Path(__file__).resolve().parents[1]
 VALID_TEXT = "Summer sale! Get 50% off today only - limited time offer"
 NEW_URL = "https://cdn.example.com/ads/generated_zzz_9187.png"
+MODULE_NAMES = ("config", "models", "repository", "validation", "file_store", "image_store",
+                "video_store", "publishing", "service", "publish")
+
+
+def load_isolated_modules(test_case, data_dir, names=MODULE_NAMES):
+    """Load fresh copies of the modules on test_case, storing data in data_dir."""
+    env = patch.dict(os.environ, {"ADS_STACK_DATA_DIR": str(data_dir)})
+    env.start()
+    test_case.addCleanup(env.stop)
+    modules = patch.dict(sys.modules)
+    modules.start()
+    test_case.addCleanup(modules.stop)
+    # Load fresh modules after setting storage, without creating project data.
+    for name in names:
+        spec = importlib.util.spec_from_file_location(name, BASE_DIR / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        setattr(test_case, name, module)
 
 
 class AdsStackTests(unittest.TestCase):
@@ -29,20 +48,7 @@ class AdsStackTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="ads-stack-test-")
         self.addCleanup(temporary.cleanup)
         self.data_dir = Path(temporary.name)
-        env = patch.dict(os.environ, {"ADS_STACK_DATA_DIR": str(self.data_dir)})
-        env.start()
-        self.addCleanup(env.stop)
-        modules = patch.dict(sys.modules)
-        modules.start()
-        self.addCleanup(modules.stop)
-        # Load fresh modules after setting storage, without creating project data.
-        for name in ("config", "models", "repository", "validation", "file_store", "image_store",
-                     "video_store", "publishing", "service", "publish"):
-            spec = importlib.util.spec_from_file_location(name, BASE_DIR / f"{name}.py")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-            setattr(self, name, module)
+        load_isolated_modules(self, self.data_dir)
         self.seeded = json.loads((BASE_DIR / "images.json").read_text())
         self.token = self.create_account(1, "Advertiser One")
 

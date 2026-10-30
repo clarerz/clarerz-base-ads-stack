@@ -1,7 +1,9 @@
 # Simple Ads Stack
 
 A small Python base for authenticated ad accounts, image and video uploads, ad
-publishing, and persistent reads. Uses only the Python standard library; no installation or server is needed.
+publishing, and persistent reads. The core library uses only the Python standard
+library and needs no installation; the optional HTTP API needs the packages in
+`requirements.txt`.
 
 ## Quick start
 
@@ -59,6 +61,66 @@ missing video.
 Accounts created before authentication have no token and cannot write until an
 operator issues one with `AdsService(repository).issue_access_token(account_id)`.
 That call also replaces a lost or leaked token; the old one stops working.
+
+## HTTP API
+
+`api.py` serves the same objects over HTTP with FastAPI. Install its packages
+into a virtual environment and start it with an admin key:
+
+```bash
+uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
+ADS_ADMIN_KEY="<secret>" .venv/bin/uvicorn api:app --host 127.0.0.1 --port 8000
+```
+
+Interactive docs are served at `/docs`. Every secret travels as
+`Authorization: Bearer <secret>`; tokens are never read from bodies or query
+strings. `POST /accounts` takes the admin key from `ADS_ADMIN_KEY`; without one,
+no account can be created. Every other authenticated route takes the account's
+access token. JSON bodies hold the same fields as the Python API, and errors
+use the same `{"error_code", "error_message"}` body.
+
+| Method | Path | Auth | Success |
+| --- | --- | --- | --- |
+| `POST` | `/accounts` (`{"id", "name"}`) | Admin key | 201 `{"id", "access_token"}` |
+| `GET` | `/accounts/{account_id}` | None | 200 `{"id", "name"}` |
+| `PATCH` | `/accounts/{account_id}` (`{"name"}`) | Account token | 200 `{"id", "name"}` |
+| `POST` | `/accounts/{account_id}/ads` (`text` plus one image field or `video_id`) | Account token | 201 `{"id"}` |
+| `GET` | `/accounts/{account_id}/ads?limit&cursor&since&until` | None | 200 `{"data", "next_cursor"}` |
+| `GET` | `/ads/{ad_id}?fields=text,image_hash` | None | 200 ad or projected fields |
+| `POST` | `/accounts/{account_id}/images?filename=&image_name=` (raw bytes) | Account token | 201 `{"hash"}` |
+| `GET` | `/accounts/{account_id}/images?limit&cursor&since&until` | Account token | 200 `{"data", "next_cursor"}` |
+| `POST` | `/accounts/{account_id}/videos?filename=&name=` (raw bytes) | Account token | 201 `{"id"}` |
+| `GET` | `/accounts/{account_id}/videos?limit&cursor&since&until` | Account token | 200 `{"data", "next_cursor"}` |
+| `GET` | `/videos/{video_id}` | Account token | 200 video |
+| `PATCH` | `/videos/{video_id}` (`{"name"}`) | Account token | 200 video |
+
+Status codes: `001` and `002` errors return 400, except `002` for
+`access_token` (a missing or wrong token or admin key), which returns 401. A
+body that is not a JSON object returns 400 with `002` for `body`. An unknown path
+returns 404 with `002` for `path`, and an unsupported method 405 with `002` for
+`method`. Reads of missing records return 404 with `002` for the ID field
+(`account_id`, `ad_id`).
+`/videos/{video_id}` returns the same 404 with `002` for `video_id` for a missing
+video and for a missing or wrong token, so callers cannot probe video IDs. Storage
+failures (`003`) return 503.
+
+JSON bodies are limited to 64 KiB (`api.MAX_JSON_BYTES`) and must declare a
+`Content-Length`. Larger bodies return 413 and chunked ones 411, both with `002`
+for `body`, before authentication runs, so the server never buffers an
+unauthenticated body of unbounded size.
+
+The account in the path stands in for `creator_id` when publishing, so a body
+that names `creator_id` or `access_token` returns `001`. An unknown account in an
+ad route is reported as `002` for `creator_id`, and in an upload or listing route
+as `002` for `owner_id`.
+
+Uploads send the file's bytes as the request body with a `Content-Length`
+header. `filename` supplies only the extension (the same extensions as the
+Python API); it never names a file on the server. The server checks the token,
+`image_name` or the video `name`, the extension, and the declared length before reading the body,
+spools it under `uploads/` in the data directory, and deletes the spooled copy
+afterwards. A missing `Content-Length` (for example a chunked upload) returns
+411 and a body over the size limit returns 413, both with `002` for `file`.
 
 ## Objects and fields
 
@@ -165,6 +227,7 @@ and metadata. The existing functions in `publish.py` still return dictionaries.
 | `file_store.py` | Size-limited copy of a local file into storage, named by content hash. |
 | `video_store.py` | Local video storage on top of `file_store`. |
 | `publish.py` | Compatibility API that translates objects and errors into dictionaries. |
+| `api.py` | FastAPI HTTP API over `AdsService`; maps errors to HTTP status codes. |
 
 Use the object API to work directly with accounts and ads:
 
@@ -287,12 +350,24 @@ Run the local business behavior tests with Python's standard library:
 python3 -m unittest discover -s tests -v
 ```
 
+The HTTP API tests need the packages in `requirements.txt` and are skipped
+without them. Run every suite from the virtual environment:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+`tests/test_api.py` drives the app in process with FastAPI's `TestClient`;
+`tests/test_api_e2e.py` starts a real uvicorn server on a free port and calls
+it over HTTP, covering chunked uploads, configuration from the environment, and
+persistence across a server restart.
+
 The tests use temporary storage and include fresh-process persistence checks.
 They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The suite has 104 tests, including boundary cases, storage failures, rollback,
+The standard-library suite has 107 tests, including boundary cases, storage failures, rollback,
 schema migrations, concurrent SQLite ad ID allocation and registry writes, token
 and ownership enforcement, size limits, and ad, video, and image listings. See
 [VERIFICATION.md](VERIFICATION.md) for the test audit, deliberate regression
