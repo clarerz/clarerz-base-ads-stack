@@ -24,7 +24,8 @@ class ValidationError(ValueError):
         self.code = code
         self.field = field
         message = {"001": f"{field} is an invalid field on this endpoint",
-                   "003": f"Storage failed while handling {field}"}.get(
+                   "003": f"Storage failed while handling {field}",
+                   "004": f"This {field} was already uploaded to this account"}.get(
                        code, f"The value provided for {field} is invalid")
         super().__init__(message)
 

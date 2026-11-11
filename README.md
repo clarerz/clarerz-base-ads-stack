@@ -104,6 +104,21 @@ returns 404 with `002` for `path`, and an unsupported method 405 with `002` for
 video and for a missing or wrong token, so callers cannot probe video IDs. Storage
 failures (`003`) return 503.
 
+Uploading content the account already uploaded returns 409 with `004` for `file`
+and names the existing asset, changing nothing (an image re-upload does not
+rename it):
+
+```json
+{"error_code": "004", "error_message": "This file was already uploaded to this account",
+ "hash": "<existing image hash>"}
+```
+
+Videos carry `"id"` instead of `"hash"`. Only byte-identical content counts, and
+only the account's own uploads: an image ingested from a link does not, and
+another account uploading the same bytes succeeds as usual, so the error reveals
+nothing about other accounts' files. The Python API does not use `004`; it still
+accepts re-uploads.
+
 JSON bodies are limited to 64 KiB (`api.MAX_JSON_BYTES`) and must declare a
 `Content-Length`. Larger bodies return 413 and chunked ones 411, both with `002`
 for `body`, before authentication runs, so the server never buffers an
@@ -133,7 +148,7 @@ have `video_id: None`; video ads have `image_hash: None`. Errors contain
 `error_code` and `error_message`: `001` means an unknown/duplicate field, `002`
 an invalid value, and `003` a storage failure while handling the named field or
 resource (`ad`, `account`, `image`, or `video`); the same request may succeed
-when retried. Reads return `None` only for records that are missing. Text must
+when retried. The HTTP API adds `004` for a duplicate upload. Reads return `None` only for records that are missing. Text must
 contain at least three characters and must not look like a URL or a hash (16–64
 hex digits, such as an image hash); long words like `Internationalization` are
 fine.
@@ -304,13 +319,20 @@ storage. A different repository must implement the `AdsRepository` protocol in
 By default, generated data lives beside the modules under `data/`:
 
 - `ads.db`: SQLite accounts, ads, videos, and image ownership.
-- `image_store_data/`: copied local files, named by content hash, and
-  `persisted_images.json`. Identical bytes are kept once, under the suffix of
-  the first upload to be registered. Registered paths are absolute: a copied data
-  directory keeps its local copy on re-upload, but its registry entries still
-  name the original location.
-- `videos/`: uploaded video files, named by the first 32 hex characters of their
-  SHA-256. Identical uploads share one file.
+- `image_store_data/`: copied local files, named by the first 32 hex characters
+  of their SHA-256 with no extension, and `persisted_images.json`. Registered
+  paths are absolute: a copied data directory keeps its local copy on re-upload,
+  but its registry entries still name the original location.
+- `videos/`: uploaded video files, named the same way.
+
+Uploads are deduplicated before they reach storage. The source is hashed first;
+if a file with that hash is already stored, including an image that an older
+build stored as `<hash><suffix>`, nothing is written. Otherwise the file is
+copied and checked against the first hash; a source that changed in between
+returns `002` for `file`. A file's name depends only on its content, so
+byte-identical uploads never get two names, even when they arrive at the same
+time. Similar but different content, such as the same picture in another aspect
+ratio, has a different hash and is stored separately.
 
 Set `ADS_STACK_DATA_DIR` before importing the modules to use another location:
 
@@ -367,7 +389,7 @@ They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The standard-library suite has 107 tests, including boundary cases, storage failures, rollback,
+The standard-library suite has 108 tests, including boundary cases, storage failures, rollback,
 schema migrations, concurrent SQLite ad ID allocation and registry writes, token
 and ownership enforcement, size limits, and ad, video, and image listings. See
 [VERIFICATION.md](VERIFICATION.md) for the test audit, deliberate regression

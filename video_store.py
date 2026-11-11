@@ -9,4 +9,4 @@ MAX_VIDEO_BYTES = 1024 ** 3  # 1 GiB
 
 def store_video(path) -> str:
     """Copy a local file of at most MAX_VIDEO_BYTES into storage and return its hash handle."""
-    return file_store.store_file(path, VIDEO_DIR, MAX_VIDEO_BYTES)
+    return file_store.store_file(path, VIDEO_DIR, MAX_VIDEO_BYTES)[0]

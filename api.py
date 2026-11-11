@@ -1,5 +1,6 @@
 """Public HTTP API over AdsService. Run with: ADS_ADMIN_KEY=<secret> uvicorn api:app"""
 
+import hashlib
 import hmac
 import os
 from pathlib import Path
@@ -38,12 +39,25 @@ def with_status(exc, status):
     return exc
 
 
+class DuplicateUpload(ValidationError):
+    """The account already uploaded this content; the body names the existing asset."""
+
+    def __init__(self, **existing):
+        super().__init__("004", "file")
+        self.existing = existing
+
+    def to_dict(self):
+        return {**super().to_dict(), **self.existing}
+
+
 def status_for(exc):
     status = getattr(exc, "status", None)
     if status is not None:
         return status
     if exc.code == "003":
         return 503
+    if exc.code == "004":
+        return 409
     if exc.code == "002" and exc.field == "access_token":
         return 401
     return 400
@@ -147,7 +161,7 @@ def _authenticated_owner(repository, account_id, token):
 
 
 async def spool_upload(request, account_id, token, filename, extensions, max_bytes):
-    """Write an authenticated upload's body to a temp file; return (owner_id, path).
+    """Write an authenticated upload's body to a temp file; return (owner_id, path, hash).
 
     Every check runs before anything is written, so rejected uploads cost no disk. Only
     the suffix of filename is used: clients never choose a server path. The caller
@@ -173,6 +187,8 @@ async def spool_upload(request, account_id, token, filename, extensions, max_byt
     except OSError as exc:  # Disk full or unwritable data directory.
         raise StorageError("file") from exc
     path = Path(spool.name)
+    # Hashed while spooling, with the 32-character content hash file_store names files by.
+    digest = hashlib.sha256()
     try:
         with spool:
             size = 0
@@ -181,6 +197,7 @@ async def spool_upload(request, account_id, token, filename, extensions, max_byt
                 size += len(chunk)
                 if size > max_bytes:
                     raise with_status(ValidationError("002", "file"), 413)
+                digest.update(chunk)
                 spool.write(chunk)
     except OSError as exc:
         path.unlink(missing_ok=True)
@@ -189,7 +206,7 @@ async def spool_upload(request, account_id, token, filename, extensions, max_byt
         # Includes a client that disconnects mid-body.
         path.unlink(missing_ok=True)
         raise
-    return owner_id, path
+    return owner_id, path, digest.hexdigest()[:32]
 
 
 @router.post("/accounts/{account_id}/images", status_code=201)
@@ -198,11 +215,17 @@ async def upload_image(account_id: str, request: Request, filename: str | None =
     data = {}
     if image_name is not None:
         data["image_name"] = validate_name(image_name, "image_name")
-    owner_id, path = await spool_upload(request, account_id, token, filename, IMAGE_EXTENSIONS,
-                                        image_store.MAX_IMAGE_BYTES)
+    owner_id, path, content_hash = await spool_upload(request, account_id, token, filename,
+                                                      IMAGE_EXTENSIONS, image_store.MAX_IMAGE_BYTES)
+    service = request.app.state.service
     try:
+        # Only this account's own uploads count, so the error never reveals another
+        # account's files; checked first, so a duplicate changes nothing (not even the name).
+        if await run_in_threadpool(call, "file", service.repository.owns_image, owner_id,
+                                   content_hash):
+            raise DuplicateUpload(hash=content_hash)
         image_hash = await run_in_threadpool(
-            call, "image", request.app.state.service.upload_image,
+            call, "image", service.upload_image,
             {**data, "owner_id": owner_id, "access_token": token, "file": str(path)})
     finally:
         path.unlink(missing_ok=True)
@@ -220,11 +243,18 @@ def list_images(account_id: str, page=Depends(page_params), token=Depends(bearer
 async def upload_video(account_id: str, request: Request, filename: str | None = None,
                        name: str | None = None, token=Depends(bearer_token)):
     name = validate_name(name)
-    owner_id, path = await spool_upload(request, account_id, token, filename, VIDEO_EXTENSIONS,
-                                        video_store.MAX_VIDEO_BYTES)
+    owner_id, path, content_hash = await spool_upload(request, account_id, token, filename,
+                                                      VIDEO_EXTENSIONS, video_store.MAX_VIDEO_BYTES)
+    service = request.app.state.service
     try:
+        # ponytail: check-then-insert, so two simultaneous identical uploads can both succeed;
+        # add a unique (owner_id, video_hash) index if that must never happen.
+        existing = await run_in_threadpool(call, "file", service.repository.get_video_by_hash,
+                                           owner_id, content_hash)
+        if existing is not None:
+            raise DuplicateUpload(id=existing.id)
         video = await run_in_threadpool(
-            call, "video", request.app.state.service.upload_video,
+            call, "video", service.upload_video,
             {"owner_id": owner_id, "access_token": token, "name": name, "file": str(path)})
     finally:
         path.unlink(missing_ok=True)

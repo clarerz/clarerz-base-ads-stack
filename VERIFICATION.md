@@ -18,7 +18,7 @@
 
 ## Coverage
 
-104 test methods, with parameterized subtests, cover:
+108 standard-library test methods (136 with the HTTP API suites), with parameterized subtests, cover:
 
 | Area | Checks |
 | --- | --- |
@@ -26,7 +26,7 @@
 | Authentication | Every write, image and video listing, and `get_video` rejects missing, wrong, non-string, and other accounts' tokens; authentication runs before ownership checks; failed lookups fail closed; missing videos and wrong tokens get the same error, and so do failed video and token lookups (an outage that fails only token lookups could still tell existing IDs from missing ones). |
 | Ad publishing | Full stored record, ID uniqueness, text and ID normalization, IDs bounded to 0..2^63-1, hex-only hash-like text, unknown and missing fields, exactly one image field, link-only `image`, hash and name resolution, video ads, one clock reading per publish. |
 | Image ownership | Upload and link ingestion grant ownership; other accounts' and unstored images are rejected; names are per account and unique within it. |
-| Uploads | Content hashes, durable copies in the data directory, one copy per content even across suffixes and concurrent uploads, real 30 MiB image boundary, video size limit, partial-copy cleanup, image and video extensions, unreadable sources as invalid input, header dimensions for PNG, GIF, JPEG, and WEBP with a bounded JPEG walk, input validation before storage. |
+| Uploads | Content hashes, durable copies in the data directory, one copy per content even across suffixes and concurrent uploads, known content found by hash before any write (including older `<hash><suffix>` files), sources that change while being stored rejected, HTTP 409 `004` for an account's own byte-identical re-uploads but not for other accounts', real 30 MiB image boundary, video size limit, partial-copy cleanup, image and video extensions, unreadable sources as invalid input, header dimensions for PNG, GIF, JPEG, and WEBP with a bounded JPEG walk, input validation before storage. |
 | Listings | Ads, videos, and images: newest-first keyset pagination, tie order, stability across new rows, inclusive/exclusive time filters combined with cursors, invalid parameters, storage failures; image URL, stored dimensions, and the pre-cutoff placeholder. |
 | Reads | Full objects, projections of every supported shape including comma-separated strings, invalid projections, missing records, `get_video`. |
 | Image registry | Seeded records, unreadable seed file fails loudly, metadata-only URL ingestion, damaged registry left untouched, interrupted writes keep the previous registry, concurrent URL and file ingestions from several processes all kept. |
@@ -56,16 +56,15 @@ every mutation below produced failures:
 
 Later fixes were each test-first: the new test failed against the previous
 code and passed after the change. Commit reviewers also confirmed by mutation
-that the suite fails without the migration write lock or its re-check, without
-the registry file lock, and with a string compare instead of `samefile` for
-duplicate image copies.
+that the suite fails without the migration write lock or its re-check, or without
+the registry file lock.
 
 This shows the suite detects these specific regressions; it is not an exhaustive
 mutation score or a proof of correctness.
 
 ## Result and limits
 
-All 104 tests pass using:
+All 108 standard-library tests pass using:
 
 ```bash
 python3 -m unittest discover -s tests -v

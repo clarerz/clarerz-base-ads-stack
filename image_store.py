@@ -4,7 +4,7 @@ URL ingestion records metadata using a URL-derived hash; it does not download
 image bytes. Local files are copied and hashed by content.
 """
 
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -99,21 +99,6 @@ def _register(entry: Dict, key: str) -> Dict:
 
 def _has_size(entry: Dict) -> bool:
     return all(type(entry.get(side)) is int and entry[side] > 0 for side in ("width", "height"))
-
-
-def _drop_duplicate_copy(registered: Optional[str], copy: str) -> None:
-    """Delete copy when the registry already keeps these bytes in another file."""
-    # Compare files, not path strings: a re-upload with the same suffix, or one through a
-    # symlinked directory, rewrote the registered file itself and must not delete it. A
-    # registered file outside this store (a data directory copied elsewhere) may later
-    # disappear, so the local copy is kept.
-    # Cleanup is best effort: a concurrent upload may have removed the copy already, and a
-    # leftover copy is harmless, so neither may fail an upload that registered.
-    with suppress(OSError):
-        if (registered and os.path.exists(registered)
-                and os.path.samefile(os.path.dirname(registered), _PERSIST_DIR)
-                and not os.path.samefile(registered, copy)):
-            os.unlink(copy)
 
 
 def image_dimensions(path: str) -> Optional[Tuple[int, int]]:
@@ -259,24 +244,21 @@ def store_image(image_input: str) -> Dict:
         )
 
     try:
-        # Copy and hash in one pass; files over MAX_IMAGE_BYTES raise ValueError.
-        suffix = os.path.splitext(real_path)[1] or ".bin"
-        file_hash = file_store.store_file(real_path, _PERSIST_DIR, MAX_IMAGE_BYTES, suffix)
-        dest_path = os.path.join(_PERSIST_DIR, f"{file_hash}{suffix}")
+        # Bytes already stored are found by hash and not copied again; files over
+        # MAX_IMAGE_BYTES raise ValueError.
+        file_hash, dest_path = file_store.store_file(real_path, _PERSIST_DIR, MAX_IMAGE_BYTES)
 
         new_id = f"img_{file_hash[:8]}"
         entry = {
             "id": new_id,
             "url": None,
             "hash": file_hash,
-            "path": dest_path,
+            "path": str(dest_path),
             "original_path": real_path,
             "source": "file_handle",
         }
         entry["width"], entry["height"] = image_dimensions(dest_path) or (None, None)
-        stored = _register(entry, "hash")
-        _drop_duplicate_copy(stored.get("path"), dest_path)
-        return stored
+        return _register(entry, "hash")
     except ValueError:
         raise
     except Exception as e:

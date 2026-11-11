@@ -261,6 +261,51 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([video["name"] for video in response.json()["data"]], ["Promo 2"])
         self.assertIsNone(response.json()["next_cursor"])
 
+    def assert_duplicate(self, response, **existing):
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json(), {
+            "error_code": "004",
+            "error_message": "This file was already uploaded to this account", **existing})
+
+    def test_same_account_duplicate_uploads_conflict(self):
+        image_hash = self.upload_image(b"img-bytes", image_name="hero").json()["hash"]
+        video_id = self.upload_video().json()["id"]
+        # The same bytes under another file name, label, or video name name the existing
+        # asset and change nothing.
+        self.assert_duplicate(self.upload_image(b"img-bytes", filename="copy.gif",
+                                                image_name="renamed"), hash=image_hash)
+        self.assert_duplicate(self.upload_video(filename="copy.mov", name="Other"), id=video_id)
+        self.assert_spool_empty()
+        owner = self.bearer(self.token)
+        images = self.client.get("/accounts/1/images", headers=owner).json()["data"]
+        self.assertEqual([(image["hash"], image["image_name"]) for image in images],
+                         [(image_hash, "hero")])
+        videos = self.client.get("/accounts/1/videos", headers=owner).json()["data"]
+        self.assertEqual([(video["id"], video["name"]) for video in videos], [(video_id, "Promo")])
+        # Different bytes are not duplicates, however similar.
+        self.assertEqual(self.upload_image(b"img-bytes!").status_code, 201)
+        self.assertEqual(self.upload_video(b"video!").status_code, 201)
+        # Another account's identical uploads succeed, so the error reveals nothing about
+        # other accounts' files.
+        other = self.bearer(self.create_account(2, "Advertiser Two"))
+        response = self.client.post("/accounts/2/images", content=b"img-bytes",
+                                    params={"filename": "a.png"}, headers=other)
+        self.assertEqual((response.status_code, response.json()), (201, {"hash": image_hash}))
+        response = self.client.post("/accounts/2/videos", content=b"video",
+                                    params={"filename": "v.mp4", "name": "Promo"}, headers=other)
+        self.assertEqual(response.status_code, 201, response.text)
+
+    def test_duplicate_check_storage_failure_is_503(self):
+        self.upload_image(b"img-bytes")
+        self.upload_video()
+        repository = self.client.app.state.service.repository
+        failure = sqlite3.OperationalError("database is locked")
+        with patch.object(repository, "owns_image", side_effect=failure):
+            self.assert_error(self.upload_image(b"img-bytes"), 503, "003", "file")
+        with patch.object(repository, "get_video_by_hash", side_effect=failure):
+            self.assert_error(self.upload_video(), 503, "003", "file")
+        self.assert_spool_empty()
+
     def test_video_not_found_and_wrong_token_match(self):
         self.assertEqual(self.upload_video().status_code, 201)
         other = self.create_account(2, "Advertiser Two")

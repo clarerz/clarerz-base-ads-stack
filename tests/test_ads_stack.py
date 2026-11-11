@@ -892,10 +892,11 @@ class AdsStackTests(unittest.TestCase):
         self.assertIsNone(self.video_repository().get_video(1))
 
     def test_failed_copy_leaves_no_partial_video(self):
-        # Fail mid-copy, after the temporary file exists.
+        # Hash the source, then fail mid-copy, after the temporary file exists.
         digest = Mock()
         digest.update.side_effect = RuntimeError("Read failed")
-        with patch.object(self.file_store, "hashlib", Mock(sha256=Mock(return_value=digest))):
+        sha256 = Mock(side_effect=[hashlib.sha256(), digest])
+        with patch.object(self.file_store, "hashlib", Mock(sha256=sha256)):
             self.assert_error(self.publish.upload_video(self.video_payload()), "003", "file")
         self.assertEqual(list(self.video_store.VIDEO_DIR.iterdir()), [])
 
@@ -1209,23 +1210,24 @@ class AdsStackTests(unittest.TestCase):
         # Same bytes, same hash: one registry entry and one stored copy.
         self.assertEqual(len([image for image in self.image_store.list_images()
                               if image["hash"] == expected]), 1)
-        self.assertIn(f"{expected}.png", self.stored_image_files())
+        self.assertIn(expected, self.stored_image_files())
 
     def test_same_bytes_keep_one_stored_copy(self):
         first = self.image_upload(file=self.video_file("a.png", b"SAME"))["hash"]
         second = self.image_upload(file=self.video_file("b.gif", b"SAME"))["hash"]
         self.assertEqual(first, second)
-        self.assertEqual(self.stored_image_files(), [f"{first}.png"])
+        # Stored under the hash alone, so no suffix can give the same bytes a second name.
+        self.assertEqual(self.stored_image_files(), [first])
         stored = Path(self.image_store.get_image_by_hash(first)["path"])
         self.assertEqual(stored.read_bytes(), b"SAME")
-        # Re-uploading with the same suffix, or through a symlinked directory, rewrites the
-        # registered copy itself; it must never be deleted as a duplicate.
+        # Re-uploading with the same suffix, or through a symlinked directory, keeps the
+        # registered copy.
         self.image_upload(file=self.video_file("c.png", b"SAME"))
         link = self.data_dir / "linked_store"
         link.symlink_to(self.image_store._PERSIST_DIR)
         with patch.object(self.image_store, "_PERSIST_DIR", str(link)):
             self.image_upload(file=self.video_file("d.png", b"SAME"))
-        self.assertEqual(self.stored_image_files(), [f"{first}.png"])
+        self.assertEqual(self.stored_image_files(), [first])
         self.assertEqual(stored.read_bytes(), b"SAME")
 
     def test_copied_data_dir_keeps_its_copy_on_reupload(self):
@@ -1239,22 +1241,42 @@ class AdsStackTests(unittest.TestCase):
                             _PERSIST_FILE=str(moved / "image_store_data/persisted_images.json"),
                             _LOCK_FILE=str(moved / "image_registry.lock")):
             self.image_store.store_image(self.video_file("again.png", content))
-        self.assertEqual((moved / "image_store_data" / f"{image_hash}.png").read_bytes(), content)
+        self.assertEqual((moved / "image_store_data" / image_hash).read_bytes(), content)
 
-    def test_duplicate_cleanup_failure_does_not_fail_the_upload(self):
-        registered = self.image_upload(file=self.video_file("a.gif", b"SAME"))["hash"]
-        real_store_file = self.file_store.store_file
+    def test_known_content_is_not_written_again(self):
+        first = self.image_upload(file=self.video_file("a.png", b"SAME"))["hash"]
+        self.publish.upload_video(self.video_payload())
+        # A file written by an older build, named with the suffix of its first upload.
+        legacy = hashlib.sha256(b"LEGACY").hexdigest()[:32]
+        (Path(self.image_store._PERSIST_DIR) / f"{legacy}.jpg").write_bytes(b"LEGACY")
+        # Byte-identical uploads under other names and extensions are found by hash before
+        # anything is written, so no temporary copy is even created.
+        with patch.object(self.file_store, "tempfile") as no_writes:
+            self.assertEqual(self.image_upload(file=self.video_file("b.gif", b"SAME")),
+                             {"hash": first})
+            self.assertEqual(self.image_upload(file=self.video_file("c.webp", b"LEGACY")),
+                             {"hash": legacy})
+            self.assertIn("id", self.publish.upload_video(self.video_payload(
+                file=self.video_file("copy.mov", b"FAKE_VIDEO_BYTES"))))
+        no_writes.NamedTemporaryFile.assert_not_called()
+        self.assertEqual(self.stored_image_files(), sorted([first, f"{legacy}.jpg"]))
+        self.assertEqual(self.image_store.get_image_by_hash(legacy)["path"],
+                         str(Path(self.image_store._PERSIST_DIR) / f"{legacy}.jpg"))
+        self.assertEqual(len(list(self.video_store.VIDEO_DIR.iterdir())), 1)
 
-        def store_then_lose_copy(path, directory, max_bytes, suffix=""):
-            # A concurrent upload of the same bytes and suffix already removed this copy.
-            file_hash = real_store_file(path, directory, max_bytes, suffix)
-            os.unlink(os.path.join(directory, f"{file_hash}{suffix}"))
+    def test_source_changed_while_storing_is_rejected(self):
+        path = self.video_file("a.png", b"ORIGINAL")
+        real_hash_copy = self.file_store._hash_copy
+
+        def hash_then_edit(src, max_bytes, out=None):
+            file_hash = real_hash_copy(src, max_bytes, out)
+            if out is None:  # The hash pass: change the file before it is copied.
+                Path(path).write_bytes(b"EDITED")
             return file_hash
 
-        with patch.object(self.image_store.file_store, "store_file", store_then_lose_copy):
-            self.assertEqual(self.image_upload(file=self.video_file("b.png", b"SAME")),
-                             {"hash": registered})
-        self.assertEqual(self.stored_image_files(), [f"{registered}.gif"])
+        with patch.object(self.file_store, "_hash_copy", hash_then_edit):
+            self.assert_error(self.image_upload(file=path), "002", "file")
+        self.assertEqual(self.stored_image_files(), [])
 
     def test_concurrent_file_ingestion_keeps_every_image_and_one_copy(self):
         suffixes = (".png", ".gif", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -1405,7 +1427,7 @@ class AdsStackTests(unittest.TestCase):
         self.assertEqual(fits, {"hash": hashlib.sha256(at_image_limit).hexdigest()[:32]})
         self.assert_error(self.image_upload(file=self.video_file("big.png", at_image_limit + b"\0")),
                           "002", "file")
-        self.assertEqual(self.stored_image_files(), [f"{fits['hash']}.png"])
+        self.assertEqual(self.stored_image_files(), [fits["hash"]])
         # Videos: a 1 GiB fixture is impractical, so pin the value and enforce a small limit.
         self.assertEqual(self.video_store.MAX_VIDEO_BYTES, 1024 ** 3)
         at_limit, over_limit = b"12345678", b"123456789"

@@ -26,6 +26,7 @@ class AdsRepository(Protocol):
                  since: Optional[int] = None, until: Optional[int] = None) -> list: ...
     def save_video(self, owner_id: int, name: str, video_hash: str, upload_time: int) -> Video: ...
     def get_video(self, video_id: int) -> Optional[Video]: ...
+    def get_video_by_hash(self, owner_id: int, video_hash: str) -> Optional[Video]: ...
     def rename_video(self, video_id: int, name: str) -> Optional[Video]: ...
     def list_videos(self, owner_id: int, limit: int, after: Optional[tuple] = None,
                     since: Optional[int] = None, until: Optional[int] = None) -> list: ...
@@ -216,6 +217,16 @@ class SQLiteAdsRepository:
     def get_video(self, video_id):
         with closing(self._connect()) as conn:
             return self._select_video(conn, video_id)
+
+    def get_video_by_hash(self, owner_id, video_hash):
+        """Return the owner's first video with this content, or None."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT id, name, owner_id, upload_time, video_hash FROM videos "
+                "WHERE owner_id = ? AND video_hash = ? ORDER BY id LIMIT 1",
+                (owner_id, video_hash),
+            ).fetchone()
+        return Video(*row) if row is not None else None
 
     def rename_video(self, video_id, name):
         # Name is the only column ever updated; the rest is fixed at upload.
