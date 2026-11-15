@@ -21,6 +21,14 @@ def _hash_copy(src, max_bytes, out=None) -> str:
     return digest.hexdigest()[:32]
 
 
+def find_file(directory, file_hash):
+    """Return the stored file holding file_hash's content, or None."""
+    # Older builds stored images as <hash><suffix>, so that name holds these bytes too.
+    return min((path for path in Path(directory).glob(f"{file_hash}*")
+                if path.name == file_hash or path.name.startswith(f"{file_hash}.")),
+               default=None)
+
+
 def store_file(path, directory, max_bytes):
     """Store a local file in directory under its content hash; return (hash, stored path).
 
@@ -36,9 +44,7 @@ def store_file(path, directory, max_bytes):
         raise ValueError(f"cannot read {path}: {exc}") from exc
     with src:
         file_hash = _hash_copy(src, max_bytes)
-        # Older builds stored images as <hash><suffix>, so any name starting with the hash
-        # holds these bytes.
-        existing = min(directory.glob(f"{file_hash}*"), default=None)
+        existing = find_file(directory, file_hash)
         if existing is not None:
             return file_hash, existing
         src.seek(0)

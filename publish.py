@@ -81,6 +81,16 @@ def upload_image(data):
         return StorageError("image").to_dict()
 
 
+def get_image(owner_id, access_token, image_hash=None, image_name=None):
+    """Return one of the owner's images, by hash or by name, or an error dict."""
+    try:
+        return _service().get_image(owner_id, access_token, image_hash, image_name).to_dict()
+    except ValidationError as exc:
+        return exc.to_dict()
+    except Exception:
+        return StorageError("image").to_dict()
+
+
 def list_images(owner_id, access_token, limit=None, cursor=None, since=None, until=None):
     try:
         images, next_cursor = _service().list_images(owner_id, access_token, limit, cursor,

@@ -36,6 +36,7 @@ PY
 | `get_account(account_id)` | Return `id` and `name`, `None` if missing/invalid, or a `003` error if storage fails. |
 | `publish_ad(data)` | Require an existing `creator_id`, its `access_token`, one `text` field, and exactly one of `image` (link), `image_hash`, or `image_name` (image ad), or `video_id` (video ad). Return a numeric ad ID or an error. |
 | `upload_image(data)` | Require an existing `owner_id`, its `access_token`, and a local image `file` path ending in `.jpg`, `.jpeg`, `.png`, `.gif`, or `.webp`; `image_name` is optional. Return `{"hash": ...}` or an error. |
+| `get_image(owner_id, access_token, image_hash=None, image_name=None)` | Return one image the account owns, found by exactly one of `image_hash` or `image_name` (trimmed; matched exactly), with the same fields as `list_images`. An unknown image and another account's image both return `002` for the field used; giving both returns `002` for `image_name`, neither `002` for `image_hash`. Authentication runs first; a storage failure returns `003`. |
 | `list_images(owner_id, access_token, limit=None, cursor=None, since=None, until=None)` | Return one page of the images the account owns, newest first, with `image_url`, `width`, and `height`: `{"data": [...], "next_cursor": ...}`. A storage failure returns `003`. |
 | `get_ads(ad_id, fields=None)` | Return the stored ad or requested fields (a list, or a comma-separated string such as `"text, image_hash"`); unknown fields return an error, and a storage failure returns `003`. |
 | `list_ads(creator_id, limit=None, cursor=None, since=None, until=None)` | Return one page of the account's ads, newest first: `{"data": [...], "next_cursor": ...}`. Ads are public, so no token is needed; a storage failure returns `003`. |
@@ -69,7 +70,7 @@ into a virtual environment and start it with an admin key:
 
 ```bash
 uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
-ADS_ADMIN_KEY="<secret>" .venv/bin/uvicorn api:app --host 127.0.0.1 --port 8000
+ADS_ADMIN_KEY="<secret>" ADS_MEDIA_KEY="<another secret>" .venv/bin/uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
 Interactive docs are served at `/docs`. Every secret travels as
@@ -89,10 +90,12 @@ use the same `{"error_code", "error_message"}` body.
 | `GET` | `/ads/{ad_id}?fields=text,image_hash` | None | 200 ad or projected fields |
 | `POST` | `/accounts/{account_id}/images?filename=&image_name=` (raw bytes) | Account token | 201 `{"hash"}` |
 | `GET` | `/accounts/{account_id}/images?limit&cursor&since&until` | Account token | 200 `{"data", "next_cursor"}` |
+| `GET` | `/accounts/{account_id}/images/lookup?image_hash=` or `?image_name=` | Account token | 200 image |
 | `POST` | `/accounts/{account_id}/videos?filename=&name=` (raw bytes) | Account token | 201 `{"id"}` |
 | `GET` | `/accounts/{account_id}/videos?limit&cursor&since&until` | Account token | 200 `{"data", "next_cursor"}` |
 | `GET` | `/videos/{video_id}` | Account token | 200 video |
 | `PATCH` | `/videos/{video_id}` (`{"name"}`) | Account token | 200 video |
+| `GET` | `/accounts/{account_id}/media/{images\|videos}/{hash}?exp&sig` | Account token or signed URL | 200 file bytes |
 
 Status codes: `001` and `002` errors return 400, except `002` for
 `access_token` (a missing or wrong token or admin key), which returns 401. A
@@ -103,6 +106,40 @@ returns 404 with `002` for `path`, and an unsupported method 405 with `002` for
 `/videos/{video_id}` returns the same 404 with `002` for `video_id` for a missing
 video and for a missing or wrong token, so callers cannot probe video IDs. Storage
 failures (`003`) return 503.
+
+### Previews
+
+Every image and video the HTTP API returns to its owner (listings, the image
+lookup, and the video routes) carries a `preview_url`, so a page can show it with
+`<img>` or `<video>`, which cannot send a bearer token. For uploads it is a
+signed link to the stored bytes under the owning account's
+`/accounts/{account_id}/media` path, valid for 10 minutes (`api.PREVIEW_SECONDS`);
+fetch the JSON again for a fresh one. Server-side clients can instead fetch that
+path with the account's bearer token and no signature; a wrong token returns 401. Link-ingested images have no stored bytes,
+so their `preview_url` is their source link (`image_url`). Without
+`ADS_MEDIA_KEY`, `preview_url` is `null` and no media is served; use a key
+different from the admin key, shared by every server process.
+
+The signature is an HMAC-SHA256 over the account, kind, content hash, expiry, and
+the account's current token hash, so a URL opens only that account's file until it
+expires and cannot be extended or moved to other content or another account. It is
+not the account token and grants nothing else. Anyone holding the URL can fetch the
+file until then; issuing the account a new token revokes all its outstanding URLs.
+Every request, signed or with a token, checks that the account still owns the
+image or video, so content another account uploaded is not served even when the
+stored bytes are identical. A missing, expired, altered, or revoked signature, media
+the account does not own, and a missing file all return 404 with `002` for `media`. `/media` supports `Range` requests, so videos stream, and sets
+`Cache-Control: private, max-age=<seconds left>, immutable`,
+`X-Content-Type-Options: nosniff`, and `Content-Security-Policy: sandbox`. Files
+are stored without extensions, so the content type comes from their leading
+bytes (PNG, GIF, JPEG, WEBP, MP4, MOV, WebM, Matroska, AVI); anything else, such
+as the placeholder `sample.jpg`, is served as `application/octet-stream`. URLs are
+absolute, built from the request's host; behind a proxy, run uvicorn with
+`--proxy-headers` so they name the public host.
+
+The image lookup takes exactly one of `image_hash` or `image_name` and follows
+`get_image` in the Python API; a missing image, another account's image, and a
+malformed or absent lookup all return 404 with `002` for that field.
 
 Uploading content the account already uploaded returns 409 with `004` for `file`
 and names the existing asset, changing nothing (an image re-upload does not
@@ -381,15 +418,17 @@ without them. Run every suite from the virtual environment:
 
 `tests/test_api.py` drives the app in process with FastAPI's `TestClient`;
 `tests/test_api_e2e.py` starts a real uvicorn server on a free port and calls
-it over HTTP, covering chunked uploads, configuration from the environment, and
-persistence across a server restart.
+it over HTTP, covering chunked uploads, configuration from the environment,
+persistence across a server restart, and media access: owner-only by token or signed
+URL, URLs valid across processes sharing a key, and revocation when another process
+reissues the token.
 
 The tests use temporary storage and include fresh-process persistence checks.
 They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The standard-library suite has 108 tests, including boundary cases, storage failures, rollback,
+The standard-library suite has 111 tests (149 with the HTTP API suites), including boundary cases, storage failures, rollback,
 schema migrations, concurrent SQLite ad ID allocation and registry writes, token
 and ownership enforcement, size limits, and ad, video, and image listings. See
 [VERIFICATION.md](VERIFICATION.md) for the test audit, deliberate regression

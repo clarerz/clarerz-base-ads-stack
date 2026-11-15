@@ -10,21 +10,26 @@ import tempfile
 from fastapi import APIRouter, Body, Depends, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBearer
 from starlette.exceptions import HTTPException
 
 import config
+import file_store
 import image_store
 import publish
 from repository import SQLiteAdsRepository
 from service import AdsService
-from validation import (IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, AdValidator, ProjectionValidator, StorageError,
-                        ValidationError, authenticate, coerce_id, existing_account_id,
-                        validate_name)
+from validation import (HASH_REGEX, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, AdValidator,
+                        ProjectionValidator, StorageError, ValidationError, authenticate,
+                        coerce_id, existing_account_id, hash_token, validate_name)
 import video_store
 
 MAX_JSON_BYTES = 64 * 1024
+# Preview URLs let <img> and <video> load stored bytes, which they cannot do with a bearer
+# token; each URL is signed for one account's file and expires after this many seconds.
+PREVIEW_SECONDS = 600
+MEDIA_DIRS = {"images": Path(image_store._PERSIST_DIR), "videos": video_store.VIDEO_DIR}
 # Upload routes stream their bodies to disk under their own limits; other bodies are JSON.
 _UPLOAD_PATH = re.compile(r"/accounts/[^/]+/(images|videos)")
 router = APIRouter()
@@ -63,13 +68,13 @@ def status_for(exc):
     return 400
 
 
-def call(resource, fn, *args, not_found=None):
+def call(resource, fn, *args, not_found=()):
     """Run a service call; unexpected failures become 003 for resource, like publish.py."""
     try:
         return fn(*args)
     except ValidationError as exc:
         # Some routes report a field's invalid value as a missing resource.
-        if exc.code == "002" and exc.field == not_found:
+        if exc.code == "002" and exc.field in not_found:
             raise with_status(exc, 404)
         raise
     except Exception as exc:
@@ -233,10 +238,21 @@ async def upload_image(account_id: str, request: Request, filename: str | None =
 
 
 @router.get("/accounts/{account_id}/images")
-def list_images(account_id: str, page=Depends(page_params), token=Depends(bearer_token),
-                service=Depends(get_service)):
+def list_images(account_id: str, request: Request, page=Depends(page_params),
+                token=Depends(bearer_token), service=Depends(get_service)):
     images, next_cursor = call("image", service.list_images, account_id, token, *page)
-    return {"data": [image.to_dict() for image in images], "next_cursor": next_cursor}
+    return {"data": [image_json(request, token, image) for image in images],
+            "next_cursor": next_cursor}
+
+
+# A missing image and another account's image get the same 404, so hashes cannot be probed.
+@router.get("/accounts/{account_id}/images/lookup")
+def get_image(account_id: str, request: Request, image_hash: str | None = None,
+              image_name: str | None = None, token=Depends(bearer_token),
+              service=Depends(get_service)):
+    image = call("image", service.get_image, account_id, token, image_hash, image_name,
+                 not_found=("image_hash", "image_name"))
+    return image_json(request, token, image)
 
 
 @router.post("/accounts/{account_id}/videos", status_code=201)
@@ -262,24 +278,126 @@ async def upload_video(account_id: str, request: Request, filename: str | None =
 
 
 @router.get("/accounts/{account_id}/videos")
-def list_videos(account_id: str, page=Depends(page_params), token=Depends(bearer_token),
-                service=Depends(get_service)):
+def list_videos(account_id: str, request: Request, page=Depends(page_params),
+                token=Depends(bearer_token), service=Depends(get_service)):
     videos, next_cursor = call("video", service.list_videos, account_id, token, *page)
-    return {"data": [video.to_dict() for video in videos], "next_cursor": next_cursor}
+    return {"data": [video_json(request, token, video) for video in videos],
+            "next_cursor": next_cursor}
 
 
 # A missing video and another account's video get the same 404, so IDs cannot be probed.
 @router.get("/videos/{video_id}")
-def get_video(video_id: str, token=Depends(bearer_token), service=Depends(get_service)):
-    return call("video", service.get_video, video_id, token, not_found="video_id").to_dict()
+def get_video(video_id: str, request: Request, token=Depends(bearer_token),
+              service=Depends(get_service)):
+    return video_json(request, token, call("video", service.get_video, video_id, token,
+                                           not_found=("video_id",)))
 
 
 @router.patch("/videos/{video_id}")
-def rename_video(video_id: str, body: dict = Body(...), token=Depends(bearer_token),
-                 service=Depends(get_service)):
+def rename_video(video_id: str, request: Request, body: dict = Body(...),
+                 token=Depends(bearer_token), service=Depends(get_service)):
     data = check_fields(body, {"name"})
-    return call("video", service.rename_video, video_id, data.get("name"), token,
-                not_found="video_id").to_dict()
+    return video_json(request, token, call("video", service.rename_video, video_id,
+                                           data.get("name"), token, not_found=("video_id",)))
+
+
+def media_signature(key, account_id, kind, media_hash, expires, token_hash):
+    # Signing the account's token hash means issuing it a new token revokes its old URLs.
+    message = f"{account_id}/{kind}/{media_hash}/{expires}/{token_hash}".encode()
+    return hmac.new(key.encode(), message, hashlib.sha256).hexdigest()
+
+
+def media_url(request, token, kind, owner_id, media_hash):
+    """Return the owner's URL for stored bytes, valid for PREVIEW_SECONDS, or None without a key.
+
+    Only routes that have already authenticated token as owner_id's call this.
+    """
+    key = request.app.state.media_key
+    if not key:
+        return None
+    expires = int(request.app.state.service.clock()) + PREVIEW_SECONDS
+    url = request.url_for("get_media", account_id=owner_id, kind=kind, media_hash=media_hash)
+    return str(url.include_query_params(exp=expires, sig=media_signature(
+        key, owner_id, kind, media_hash, expires, hash_token(token))))
+
+
+def image_json(request, token, image):
+    # Link-ingested images have no stored bytes; their source link is the preview.
+    return {**image.to_dict(), "preview_url": image.image_url or media_url(
+        request, token, "images", image.owner_id, image.hash)}
+
+
+def video_json(request, token, video):
+    return {**video.to_dict(),
+            "preview_url": media_url(request, token, "videos", video.owner_id, video.video_hash)}
+
+
+def owns_media(repository, owner_id, kind, media_hash):
+    if kind == "images":
+        return repository.owns_image(owner_id, media_hash)
+    return repository.get_video_by_hash(owner_id, media_hash) is not None
+
+
+def media_type(path):
+    """Return the media type declared by a stored file's leading bytes."""
+    # Files are stored without extensions. Unrecognized bytes are an opaque download, never
+    # something a browser would render as a page.
+    with open(path, "rb") as f:
+        head = f.read(64)
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:4] == b"RIFF" and head[8:12] in (b"WEBP", b"AVI "):
+        return "image/webp" if head[8:12] == b"WEBP" else "video/x-msvideo"
+    if head[4:8] == b"ftyp":
+        return "video/quicktime" if head[8:12] == b"qt  " else "video/mp4"
+    if head.startswith(b"\x1a\x45\xdf\xa3"):  # EBML: WebM declares its doctype early.
+        return "video/webm" if b"webm" in head else "video/x-matroska"
+    return "application/octet-stream"
+
+
+@router.get("/accounts/{account_id}/media/{kind}/{media_hash}", name="get_media")
+def get_media(account_id: str, kind: str, media_hash: str, request: Request,
+              exp: str | None = None, sig: str | None = None, token=Depends(bearer_token)):
+    """Serve an account's stored bytes for its token, or for a preview URL issued to it."""
+    state = request.app.state
+    repository = state.service.repository
+    owner_id = coerce_id(account_id)
+    now = int(state.service.clock())
+    if token is not None:
+        # Like every account route, a wrong token is a 401 before anything is looked up.
+        authenticate(repository, owner_id, token)
+        expires = now + PREVIEW_SECONDS
+        allowed = True
+    else:
+        # Every rejection gets the same 404, so a URL reveals nothing about why it failed.
+        expires = coerce_id(exp)
+        token_hash = (call("media", repository.get_token_hash, owner_id)
+                      if owner_id is not None else None)
+        allowed = (state.media_key and isinstance(token_hash, str) and expires is not None
+                   and now < expires and sig is not None and hmac.compare_digest(
+                       sig.encode(), media_signature(state.media_key, owner_id, kind, media_hash,
+                                                     expires, token_hash).encode()))
+    # Ownership is checked on every request, not just when the URL was issued.
+    owned = (allowed and kind in MEDIA_DIRS and HASH_REGEX.fullmatch(media_hash)
+             and call("media", owns_media, repository, owner_id, kind, media_hash))
+    path = file_store.find_file(MEDIA_DIRS[kind], media_hash) if owned else None
+    if path is None:
+        raise with_status(ValidationError("002", "media"), 404)
+    try:
+        content_type = media_type(path)
+    except OSError as exc:
+        raise StorageError("media") from exc
+    # The bytes behind a hash never change, so they can be cached until the URL expires
+    # (for one URL lifetime when fetched with the token).
+    return FileResponse(path, media_type=content_type, headers={
+        "Cache-Control": f"private, max-age={expires - now}, immutable",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "sandbox",
+    })
 
 
 class JsonBodyLimit:
@@ -311,11 +429,13 @@ class JsonBodyLimit:
         await self.app(scope, receive, send)
 
 
-def create_app(service=None, admin_key=None, spool_dir=None):
+def create_app(service=None, admin_key=None, spool_dir=None, media_key=None):
     app = FastAPI(title="Ads publishing API")
     app.state.service = (service if service is not None
                          else AdsService(SQLiteAdsRepository(publish.DB_PATH)))
     app.state.admin_key = admin_key if admin_key is not None else os.environ.get("ADS_ADMIN_KEY")
+    # No key: previews carry no URL and every media request is a 404.
+    app.state.media_key = media_key if media_key is not None else os.environ.get("ADS_MEDIA_KEY")
     app.state.spool_dir = Path(spool_dir) if spool_dir is not None else config.DATA_DIR / "uploads"
     app.add_exception_handler(
         ValidationError, lambda request, exc: JSONResponse(exc.to_dict(), status_for(exc)))

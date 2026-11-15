@@ -18,7 +18,7 @@
 
 ## Coverage
 
-108 standard-library test methods (136 with the HTTP API suites), with parameterized subtests, cover:
+111 standard-library test methods (149 with the HTTP API suites), with parameterized subtests, cover:
 
 | Area | Checks |
 | --- | --- |
@@ -27,7 +27,8 @@
 | Ad publishing | Full stored record, ID uniqueness, text and ID normalization, IDs bounded to 0..2^63-1, hex-only hash-like text, unknown and missing fields, exactly one image field, link-only `image`, hash and name resolution, video ads, one clock reading per publish. |
 | Image ownership | Upload and link ingestion grant ownership; other accounts' and unstored images are rejected; names are per account and unique within it. |
 | Uploads | Content hashes, durable copies in the data directory, one copy per content even across suffixes and concurrent uploads, known content found by hash before any write (including older `<hash><suffix>` files), sources that change while being stored rejected, HTTP 409 `004` for an account's own byte-identical re-uploads but not for other accounts', real 30 MiB image boundary, video size limit, partial-copy cleanup, image and video extensions, unreadable sources as invalid input, header dimensions for PNG, GIF, JPEG, and WEBP with a bounded JPEG walk, input validation before storage. |
-| Listings | Ads, videos, and images: newest-first keyset pagination, tie order, stability across new rows, inclusive/exclusive time filters combined with cursors, invalid parameters, storage failures; image URL, stored dimensions, and the pre-cutoff placeholder. |
+| Listings | Ads, videos, and images: newest-first keyset pagination, tie order, stability across new rows, inclusive/exclusive time filters combined with cursors, invalid parameters, storage failures; image URL, stored dimensions, and the pre-cutoff placeholder; single-image fetch by hash or name. |
+| Previews | Image lookup by hash and name, `preview_url` on image and video listings and video routes, link images previewed by source URL, served bytes with sniffed content types, `Range`, cache lifetime bounded by expiry, security headers; media served only under the owning account, by its token (other and wrong tokens 401) or a URL signed for it; media it does not own 404 even when the bytes are stored; missing, altered, extended, reused (other content, kind, or account), wrong-key, revoked (token reissued), and expired signatures and missing files all 404; no key means no previews, but the token still works. |
 | Reads | Full objects, projections of every supported shape including comma-separated strings, invalid projections, missing records, `get_video`. |
 | Image registry | Seeded records, unreadable seed file fails loudly, metadata-only URL ingestion, damaged registry left untouched, interrupted writes keep the previous registry, concurrent URL and file ingestions from several processes all kept. |
 | Extensibility | Extra validation rules, custom publish stage, injected image storage and clock (shared by the service and its default publisher), custom upload and video validators, validator using the publisher's storage. |
@@ -52,6 +53,8 @@ every mutation below produced failures:
 - Read a damaged registry as empty or lose a registry write.
 - Reverse the tie order, make `since` exclusive or `until` inclusive, or accept
   an image cursor with a trailing newline.
+- Skip the preview signature or expiry check, leave the kind or token hash out of the
+  signature, skip the media ownership check or token authentication, or drop `nosniff`.
 - Skip the video extension check, or raise from `rename_video` on storage failure.
 
 Later fixes were each test-first: the new test failed against the previous
@@ -64,7 +67,7 @@ mutation score or a proof of correctness.
 
 ## Result and limits
 
-All 108 standard-library tests pass using:
+All 111 standard-library tests pass using:
 
 ```bash
 python3 -m unittest discover -s tests -v

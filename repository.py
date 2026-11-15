@@ -18,6 +18,8 @@ class AdsRepository(Protocol):
                     image_name: Optional[str] = None) -> bool: ...
     def owns_image(self, owner_id: int, image_hash: str) -> bool: ...
     def get_image_hash_by_name(self, owner_id: int, image_name: str) -> Optional[str]: ...
+    def get_image(self, owner_id: int, image_hash: Optional[str] = None,
+                  image_name: Optional[str] = None) -> Optional[Image]: ...
     def list_images(self, owner_id: int, limit: int, after: Optional[tuple] = None,
                     since: Optional[int] = None, until: Optional[int] = None) -> list: ...
     def save_ad(self, draft: AdDraft, creation_time: int) -> Ad: ...
@@ -168,6 +170,16 @@ class SQLiteAdsRepository:
                                "WHERE owner_id = ? AND image_name = ?",
                                (owner_id, image_name)).fetchone()
         return row[0] if row is not None else None
+
+    def get_image(self, owner_id, image_hash=None, image_name=None):
+        """Return the owner's image with this hash, or with this name if no hash is given."""
+        column, value = (("image_hash", image_hash) if image_hash is not None
+                         else ("image_name", image_name))
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT image_hash, owner_id, creation_time, image_name "
+                               f"FROM image_owners WHERE owner_id = ? AND {column} = ?",
+                               (owner_id, value)).fetchone()
+        return Image(*row) if row is not None else None
 
     def owns_image(self, owner_id, image_hash):
         with closing(self._connect()) as conn:

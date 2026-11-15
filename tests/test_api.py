@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import struct
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -20,6 +21,10 @@ except ImportError:
 from test_ads_stack import BASE_DIR, MODULE_NAMES, VALID_TEXT, load_isolated_modules
 
 ADMIN_KEY = "test-admin"
+MEDIA_KEY = "test-media"
+# A PNG header declaring 2x3 pixels: enough for the size and the sniffed type.
+PNG = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 2, 3) + b"\x08\x02\x00\x00\x00"
+MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16
 
 
 class ApiTests(unittest.TestCase):
@@ -30,9 +35,18 @@ class ApiTests(unittest.TestCase):
         load_isolated_modules(self, self.data_dir, MODULE_NAMES + ("api",))
         # The environment is restored on cleanup; an exported key must not stand in for None.
         os.environ.pop("ADS_ADMIN_KEY", None)
-        self.client = TestClient(self.api.create_app(admin_key=ADMIN_KEY))
+        os.environ.pop("ADS_MEDIA_KEY", None)
+        # Signing and verifying preview URLs read the service clock.
+        self.now = 1_800_000_000
+        self.client = self.make_client(MEDIA_KEY)
         self.token = self.create_account(1, "Advertiser One")
         self.seeded = json.loads((BASE_DIR / "images.json").read_text())
+
+    def make_client(self, media_key):
+        service = self.service.AdsService(
+            self.repository.SQLiteAdsRepository(self.publish.DB_PATH), clock=lambda: self.now)
+        return TestClient(self.api.create_app(service=service, admin_key=ADMIN_KEY,
+                                              media_key=media_key))
 
     def create_account(self, account_id, name):
         response = self.client.post("/accounts", json={"id": account_id, "name": name},
@@ -333,6 +347,194 @@ class ApiTests(unittest.TestCase):
         self.assert_spool_empty()
         self.assertEqual(self.client.get("/accounts/1/videos",
                                          headers=self.bearer(self.token)).json()["data"], [])
+
+    def lookup(self, token=None, **params):
+        return self.client.get("/accounts/1/images/lookup", params=params,
+                               headers=self.bearer(token or self.token))
+
+    def assert_media(self, url, content, media_type, headers=None):
+        response = self.client.get(url, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.content, content)
+        self.assertEqual(response.headers["content-type"], media_type)
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["content-security-policy"], "sandbox")
+        return response
+
+    def test_image_lookup_returns_signed_preview(self):
+        image_hash = self.upload_image(PNG, image_name="hero").json()["hash"]
+        expected = {"hash": image_hash, "owner_id": 1, "creation_time": self.now,
+                    "image_name": "hero", "image_url": None, "width": 2, "height": 3}
+        by_hash = self.lookup(image_hash=image_hash)
+        by_name = self.lookup(image_name=" hero ")
+        for response in (by_hash, by_name):
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            preview_url = body.pop("preview_url")
+            self.assertEqual(body, expected)
+            self.assertTrue(preview_url.startswith(
+                f"http://testserver/accounts/1/media/images/{image_hash}?exp={self.now + 600}&sig="))
+        response = self.assert_media(by_hash.json()["preview_url"], PNG, "image/png")
+        self.assertEqual(response.headers["cache-control"], "private, max-age=600, immutable")
+        self.assertEqual(response.headers["accept-ranges"], "bytes")
+        # Range requests work, so large media can stream.
+        response = self.client.get(by_hash.json()["preview_url"], headers={"Range": "bytes=0-3"})
+        self.assertEqual((response.status_code, response.content), (206, PNG[:4]))
+        # The cache lifetime never outlasts the signature.
+        self.now += 590
+        response = self.client.get(by_hash.json()["preview_url"])
+        self.assertEqual(response.headers["cache-control"], "private, max-age=10, immutable")
+
+    def test_image_lookup_errors(self):
+        other_token = self.create_account(2, "Advertiser Two")
+        theirs = self.client.post("/accounts/2/images", content=b"theirs",
+                                  params={"filename": "a.png", "image_name": "theirs"},
+                                  headers=self.bearer(other_token)).json()["hash"]
+        # Missing images, other accounts' images, and malformed lookups are all 404.
+        for params, field in (({"image_hash": theirs}, "image_hash"),
+                              ({"image_hash": "f" * 32}, "image_hash"),
+                              ({"image_hash": "not-a-hash"}, "image_hash"),
+                              ({"image_name": "theirs"}, "image_name"), ({}, "image_hash")):
+            with self.subTest(params=params):
+                self.assert_error(self.lookup(**params), 404, "002", field)
+        self.assert_error(self.lookup(token="wrong", image_hash=theirs), 401, "002",
+                          "access_token")
+        self.assert_error(self.client.get("/accounts/9/images/lookup",
+                                          params={"image_hash": theirs},
+                                          headers=self.bearer(self.token)),
+                          400, "002", "owner_id")
+
+    def test_listings_and_videos_carry_preview_urls(self):
+        link = self.seeded[1]
+        self.assertEqual(self.publish_ad(image=link["url"]).status_code, 201)
+        uploaded = self.upload_image(b"not an image").json()["hash"]
+        owner = self.bearer(self.token)
+        images = {image["hash"]: image["preview_url"] for image in
+                  self.client.get("/accounts/1/images", headers=owner).json()["data"]}
+        # A link-ingested image has no stored bytes; its source link is the preview.
+        self.assertEqual(images[link["hash"]], link["url"])
+        # Bytes with no recognized media header are served as an opaque download.
+        self.assert_media(images[uploaded], b"not an image", "application/octet-stream")
+        self.assertEqual(self.upload_video(MP4).status_code, 201)
+        video_hash = hashlib.sha256(MP4).hexdigest()[:32]
+        responses = (self.client.get("/videos/1", headers=owner).json(),
+                     self.client.patch("/videos/1", json={"name": "Promo 2"}, headers=owner).json(),
+                     self.client.get("/accounts/1/videos", headers=owner).json()["data"][0])
+        for video in responses:
+            with self.subTest(video=video):
+                self.assertTrue(video["preview_url"].startswith(
+                    f"http://testserver/accounts/1/media/videos/{video_hash}?exp="))
+                self.assert_media(video["preview_url"], MP4, "video/mp4")
+
+    def test_media_types_are_sniffed(self):
+        cases = {"b.gif": (b"GIF89a" + b"\x00" * 8, "image/gif"),
+                 "c.jpg": (b"\xff\xd8\xff\xe0" + b"\x00" * 8, "image/jpeg"),
+                 "d.webp": (b"RIFF\x00\x00\x00\x00WEBPVP8 ", "image/webp")}
+        for filename, (content, media_type) in cases.items():
+            with self.subTest(filename=filename):
+                image_hash = self.upload_image(content, filename=filename).json()["hash"]
+                self.assert_media(self.lookup(image_hash=image_hash).json()["preview_url"],
+                                  content, media_type)
+        videos = {"a.mov": (b"\x00\x00\x00\x14ftypqt  " + b"\x00" * 8, "video/quicktime"),
+                  "b.webm": (b"\x1a\x45\xdf\xa3\x00\x00webm", "video/webm"),
+                  "c.mkv": (b"\x1a\x45\xdf\xa3\x00\x00matroska", "video/x-matroska"),
+                  "d.avi": (b"RIFF\x00\x00\x00\x00AVI LIST", "video/x-msvideo")}
+        for video_id, (filename, (content, media_type)) in enumerate(videos.items(), 1):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.upload_video(content, filename=filename).status_code, 201)
+                url = self.client.get(f"/videos/{video_id}",
+                                      headers=self.bearer(self.token)).json()["preview_url"]
+                self.assert_media(url, content, media_type)
+
+    def test_media_urls_reject_tampering_and_expiry(self):
+        image_hash = self.upload_image(PNG).json()["hash"]
+        other_hash = self.upload_image(b"other").json()["hash"]
+        # The same bytes stored as a video too, so a swapped kind would find a file.
+        self.assertEqual(self.upload_video(PNG, filename="v.mp4").status_code, 201)
+        url = self.lookup(image_hash=image_hash).json()["preview_url"]
+        path, _, query = url.removeprefix("http://testserver").partition("?")
+        params = dict(pair.split("=") for pair in query.split("&"))
+        token_hash = self.validation.hash_token(self.token)
+        stale = self.api.media_signature(MEDIA_KEY, 1, "images", image_hash, params["exp"],
+                                         self.validation.hash_token("old token"))
+        signature = lambda kind, media_hash, exp, account_id=1, key=MEDIA_KEY: (
+            self.api.media_signature(key, account_id, kind, media_hash, exp, token_hash))
+        bad = [
+            path,  # No signature.
+            f"{path}?exp={params['exp']}",
+            f"{path}?exp={params['exp']}&sig={'0' * 64}",
+            f"{path}?exp={params['exp']}&sig={params['sig'][:-1]}",
+            f"{path}?exp={params['exp']}&sig=\u00e9",
+            f"{path}?exp={int(params['exp']) + 1}&sig={params['sig']}",  # Extended expiry.
+            f"{path}?exp=abc&sig={params['sig']}",
+            f"/accounts/1/media/images/{other_hash}?{query}",  # Reused for other content.
+            f"/accounts/1/media/videos/{image_hash}?{query}",  # ... or another kind.
+            f"/accounts/2/media/images/{image_hash}?{query}",  # ... or another account.
+            f"/accounts/1/media/other/{image_hash}?exp={params['exp']}"
+            f"&sig={signature('other', image_hash, params['exp'])}",
+            # Correctly signed, but nothing is stored under the hash.
+            f"/accounts/1/media/images/{'f' * 32}?exp={params['exp']}"
+            f"&sig={signature('images', 'f' * 32, params['exp'])}",
+            # Signed with another key, or without the account's current token.
+            f"{path}?exp={params['exp']}"
+            f"&sig={signature('images', image_hash, params['exp'], key='other-key')}",
+            f"{path}?exp={params['exp']}&sig={stale}",
+        ]
+        for candidate in bad:
+            with self.subTest(url=candidate):
+                self.assert_error(self.client.get(candidate), 404, "002", "media")
+        self.now += 599
+        self.assert_media(url, PNG, "image/png")
+        self.now += 1  # Expired at exactly exp.
+        self.assert_error(self.client.get(url), 404, "002", "media")
+
+    def test_media_is_served_only_to_the_owning_account(self):
+        other_token = self.create_account(2, "Advertiser Two")
+        image_hash = self.upload_image(PNG).json()["hash"]
+        theirs = self.client.post("/accounts/2/images", content=b"theirs",
+                                  params={"filename": "t.png"},
+                                  headers=self.bearer(other_token)).json()["hash"]
+        self.assertEqual(self.upload_video(MP4).status_code, 201)
+        video_hash = hashlib.sha256(MP4).hexdigest()[:32]
+        mine = f"/accounts/1/media/images/{image_hash}"
+        # The account's own token works without a signature, for server-side clients.
+        response = self.client.get(mine, headers=self.bearer(self.token))
+        self.assertEqual((response.status_code, response.content), (200, PNG))
+        self.assert_media(f"/accounts/1/media/videos/{video_hash}", MP4, "video/mp4",
+                          headers=self.bearer(self.token))
+        # Another account's token, or a wrong one, is rejected like on every account route.
+        for token in (other_token, "wrong"):
+            with self.subTest(token=token):
+                self.assert_error(self.client.get(mine, headers=self.bearer(token)), 401, "002",
+                                  "access_token")
+        # Media the account does not own is missing, even though the bytes are stored.
+        for path in (f"/accounts/1/media/images/{theirs}",
+                     f"/accounts/1/media/videos/{image_hash}",
+                     f"/accounts/1/media/images/{'f' * 32}"):
+            with self.subTest(path=path):
+                self.assert_error(self.client.get(path, headers=self.bearer(self.token)), 404,
+                                  "002", "media")
+        # Rotating the token revokes every preview URL issued under the old one.
+        url = self.lookup(image_hash=image_hash).json()["preview_url"]
+        self.assert_media(url, PNG, "image/png")
+        new_token = self.client.app.state.service.issue_access_token(1)
+        self.assert_error(self.client.get(url), 404, "002", "media")
+        url = self.lookup(token=new_token, image_hash=image_hash).json()["preview_url"]
+        self.assert_media(url, PNG, "image/png")
+
+    def test_no_media_key_means_no_previews(self):
+        image_hash = self.upload_image(PNG).json()["hash"]
+        url = self.lookup(image_hash=image_hash).json()["preview_url"]
+        self.client = self.make_client(None)
+        self.assertIsNone(self.lookup(image_hash=image_hash).json()["preview_url"])
+        self.assert_error(self.client.get(url), 404, "002", "media")
+        # An empty key is the same as none.
+        self.client = self.make_client("")
+        self.assertIsNone(self.lookup(image_hash=image_hash).json()["preview_url"])
+        self.assert_error(self.client.get(url), 404, "002", "media")
+        # The account's token still works.
+        self.assert_media(f"/accounts/1/media/images/{image_hash}", PNG, "image/png",
+                          headers=self.bearer(self.token))
 
     def test_every_http_error_uses_error_shape(self):
         latin1 = self.client.post("/accounts", content=b'{"id": 5, "name": "caf\xe9"}',

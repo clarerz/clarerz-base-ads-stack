@@ -230,6 +230,19 @@ class UploadValidator:
         return (self.validate_owner(owner_id),
                 *validate_page(limit, cursor, since, until, self.decode_cursor))
 
+    def validate_lookup(self, owner_id, image_hash=None, image_name=None):
+        """Return (owner_id, image_hash, image_name) for a fetch; exactly one of the two is set."""
+        owner_id = self.validate_owner(owner_id)
+        if image_hash is None and image_name is None:
+            raise ValidationError("002", "image_hash")
+        if image_hash is not None and image_name is not None:
+            raise ValidationError("002", "image_name")
+        if image_name is not None:
+            return owner_id, None, validate_name(image_name, "image_name")
+        if not isinstance(image_hash, str) or not HASH_REGEX.fullmatch(image_hash.strip()):
+            raise ValidationError("002", "image_hash")
+        return owner_id, image_hash.strip(), None
+
     def decode_cursor(self, value):
         return decode_image_cursor(value)
 

@@ -1621,6 +1621,70 @@ class AdsStackTests(unittest.TestCase):
                           return_value=self.service.AdsService(repository)):
             self.assert_error(self.publish.list_images(1, self.token), "003", "image")
 
+    def test_get_image_by_hash_or_name(self):
+        png, png_size = self.image_headers()["a.png"]
+        created = self.service.DIMENSIONS_CUTOFF + 5
+        service = self.object_service(clock=lambda: created)
+        image_hash = service.upload_image({"owner_id": 1, "access_token": self.token,
+                                           "file": self.video_file("a.png", png),
+                                           "image_name": "Spring hero"})
+        self.assertEqual(image_hash, hashlib.sha256(png).hexdigest()[:32])
+        expected = {"hash": image_hash, "owner_id": 1, "creation_time": created,
+                    "image_name": "Spring hero", "image_url": None,
+                    "width": png_size[0], "height": png_size[1]}
+        # Hashes and names are trimmed, and IDs may be digit strings, as elsewhere.
+        for lookup in ({"image_hash": image_hash}, {"image_hash": f" {image_hash} "},
+                       {"image_name": "Spring hero"}, {"image_name": " Spring hero "}):
+            with self.subTest(lookup=lookup):
+                self.assertEqual(self.publish.get_image("1", self.token, **lookup), expected)
+        image = service.get_image(1, self.token, image_name="Spring hero")
+        self.assertIsInstance(image, self.models.Image)
+        # A link-ingested image carries its URL and seeded size.
+        link = self.seeded[1]
+        self.publish_ok(self.payload(image=link["url"]))
+        fetched = self.publish.get_image(1, self.token, image_hash=link["hash"])
+        self.assertEqual((fetched["image_url"], fetched["width"], fetched["height"],
+                          fetched["image_name"]), (link["url"], 1200, 628, None))
+
+    def test_get_image_rejects_bad_lookups(self):
+        other_token = self.create_account(2, "Advertiser Two")
+        mine = self.image_upload(image_name="Mine")["hash"]
+        theirs = self.image_upload(owner_id=2, access_token=other_token,
+                                   file=self.video_file("b.png", b"OTHER_BYTES"),
+                                   image_name="Theirs")["hash"]
+        get = self.publish.get_image
+        # Another account's image, an unknown one, and a malformed handle look the same.
+        for value in (theirs, "f" * 32, "short", "a" * 65, "abc-defghijklmnopq", 123, ""):
+            with self.subTest(image_hash=value):
+                self.assert_error(get(1, self.token, image_hash=value), "002", "image_hash")
+        for value in ("Theirs", "mine", "Unknown", "  ", 5):
+            with self.subTest(image_name=value):
+                self.assert_error(get(1, self.token, image_name=value), "002", "image_name")
+        # Exactly one of hash or name; with both, the second is reported.
+        self.assert_error(get(1, self.token), "002", "image_hash")
+        self.assert_error(get(1, self.token, image_hash=mine, image_name="Mine"),
+                          "002", "image_name")
+        # Authentication runs before the lookup, so tokens cannot probe ownership.
+        for token in (None, "", "wrong", 123, other_token):
+            with self.subTest(token=token):
+                self.assert_error(get(1, token, image_hash=mine), "002", "access_token")
+                self.assert_error(get(1, token, image_hash=theirs), "002", "access_token")
+        for owner in (999999999, None, True, "x", "²"):
+            with self.subTest(owner=owner):
+                self.assert_error(get(owner, self.token, image_hash=mine), "002", "owner_id")
+        # The owner still gets it.
+        self.assertEqual(get(2, other_token, image_name="Theirs")["hash"], theirs)
+
+    def test_get_image_storage_failure(self):
+        repository = Mock()
+        repository.get_account.return_value = self.models.AdAccount(1, "Advertiser")
+        repository.get_token_hash.return_value = self.validation.hash_token(self.token)
+        repository.get_image.side_effect = OSError("DB unavailable")
+        with patch.object(self.publish, "_service",
+                          return_value=self.service.AdsService(repository)):
+            self.assert_error(self.publish.get_image(1, self.token, image_hash="a" * 32),
+                              "003", "image")
+
     def test_publish_rejects_hashes_missing_from_image_store(self):
         data = self.payload(image_hash="f" * 32)
         del data["image"]

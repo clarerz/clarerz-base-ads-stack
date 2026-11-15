@@ -100,6 +100,17 @@ class AdsService:
         page = [self._describe(image) for image in images[:limit]]
         return page, encode_image_cursor(page[-1]) if len(images) > limit else None
 
+    def get_image(self, owner_id, access_token, image_hash=None, image_name=None):
+        """Return the owner's image, found by hash or by name, with its URL and dimensions."""
+        owner_id, image_hash, image_name = self.image_validator.validate_lookup(
+            owner_id, image_hash, image_name)
+        authenticate(self.repository, owner_id, access_token)
+        image = self.repository.get_image(owner_id, image_hash, image_name)
+        if image is None:
+            # Unknown images and other accounts' images get the same error.
+            raise ValidationError("002", "image_hash" if image_hash is not None else "image_name")
+        return self._describe(image)
+
     def _describe(self, image):
         """Add the stored URL and dimensions to an owned image."""
         # ponytail: one registry lookup (a full JSON parse) per listed image; read the
