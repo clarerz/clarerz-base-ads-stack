@@ -10,13 +10,15 @@ import tempfile
 from fastapi import APIRouter, Body, Depends, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPBearer
 from starlette.exceptions import HTTPException
 
 import config
 import file_store
 import image_store
+from models import Image
+import previews
 import publish
 from repository import SQLiteAdsRepository
 from service import AdsService
@@ -159,8 +161,8 @@ def get_ad(ad_id: str, fields: str | None = None, service=Depends(get_service)):
     return ProjectionValidator().project(ad, fields)
 
 
-def _authenticated_owner(repository, account_id, token):
-    owner_id = existing_account_id(repository, account_id, "owner_id")
+def _authenticated_owner(repository, account_id, token, field="owner_id"):
+    owner_id = existing_account_id(repository, account_id, field)
     authenticate(repository, owner_id, token)
     return owner_id
 
@@ -307,29 +309,57 @@ def media_signature(key, account_id, kind, media_hash, expires, token_hash):
     return hmac.new(key.encode(), message, hashlib.sha256).hexdigest()
 
 
-def media_url(request, token, kind, owner_id, media_hash):
-    """Return the owner's URL for stored bytes, valid for PREVIEW_SECONDS, or None without a key.
+def signed_url(request, token_hash, owner_id, scope, subject, route, expires=None, **path):
+    """Return a URL for route signed for owner_id's scope and subject, valid until expires
+    (default: PREVIEW_SECONDS from now).
 
-    Only routes that have already authenticated token as owner_id's call this.
+    None without a key. Only callers that have authenticated owner_id (by token or signed URL)
+    call this; token_hash is the account's current one.
     """
     key = request.app.state.media_key
     if not key:
         return None
-    expires = int(request.app.state.service.clock()) + PREVIEW_SECONDS
-    url = request.url_for("get_media", account_id=owner_id, kind=kind, media_hash=media_hash)
+    if expires is None:
+        expires = int(request.app.state.service.clock()) + PREVIEW_SECONDS
+    url = request.url_for(route, account_id=owner_id, **path)
     return str(url.include_query_params(exp=expires, sig=media_signature(
-        key, owner_id, kind, media_hash, expires, hash_token(token))))
+        key, owner_id, scope, subject, expires, token_hash)))
+
+
+def media_url(request, token_hash, kind, owner_id, media_hash, expires=None):
+    return signed_url(request, token_hash, owner_id, kind, media_hash, "get_media", expires,
+                      kind=kind, media_hash=media_hash)
+
+
+def signed_access(request, owner_id, token, exp, sig, scope, subject, field):
+    """Return (expiry, token hash) for a request with owner_id's token or a live URL signed for
+    scope and subject, or None for any bad signature. A wrong token raises 401."""
+    state = request.app.state
+    repository = state.service.repository
+    now = int(state.service.clock())
+    if token is not None:
+        # Like every account route, a wrong token is a 401 before anything is looked up.
+        authenticate(repository, owner_id, token)
+        return now + PREVIEW_SECONDS, hash_token(token)
+    expires = coerce_id(exp)
+    token_hash = (call(field, repository.get_token_hash, owner_id)
+                  if owner_id is not None else None)
+    valid = (state.media_key and isinstance(token_hash, str) and expires is not None
+             and now < expires and sig is not None and hmac.compare_digest(
+                 sig.encode(), media_signature(state.media_key, owner_id, scope, subject,
+                                               expires, token_hash).encode()))
+    return (expires, token_hash) if valid else None
 
 
 def image_json(request, token, image):
     # Link-ingested images have no stored bytes; their source link is the preview.
     return {**image.to_dict(), "preview_url": image.image_url or media_url(
-        request, token, "images", image.owner_id, image.hash)}
+        request, hash_token(token), "images", image.owner_id, image.hash)}
 
 
 def video_json(request, token, video):
-    return {**video.to_dict(),
-            "preview_url": media_url(request, token, "videos", video.owner_id, video.video_hash)}
+    return {**video.to_dict(), "preview_url": media_url(
+        request, hash_token(token), "videos", video.owner_id, video.video_hash)}
 
 
 def owns_media(repository, owner_id, kind, media_hash):
@@ -363,26 +393,13 @@ def media_type(path):
 def get_media(account_id: str, kind: str, media_hash: str, request: Request,
               exp: str | None = None, sig: str | None = None, token=Depends(bearer_token)):
     """Serve an account's stored bytes for its token, or for a preview URL issued to it."""
-    state = request.app.state
-    repository = state.service.repository
+    service = request.app.state.service
+    repository = service.repository
     owner_id = coerce_id(account_id)
-    now = int(state.service.clock())
-    if token is not None:
-        # Like every account route, a wrong token is a 401 before anything is looked up.
-        authenticate(repository, owner_id, token)
-        expires = now + PREVIEW_SECONDS
-        allowed = True
-    else:
-        # Every rejection gets the same 404, so a URL reveals nothing about why it failed.
-        expires = coerce_id(exp)
-        token_hash = (call("media", repository.get_token_hash, owner_id)
-                      if owner_id is not None else None)
-        allowed = (state.media_key and isinstance(token_hash, str) and expires is not None
-                   and now < expires and sig is not None and hmac.compare_digest(
-                       sig.encode(), media_signature(state.media_key, owner_id, kind, media_hash,
-                                                     expires, token_hash).encode()))
+    # Every rejection gets the same 404, so a URL reveals nothing about why it failed.
+    access = signed_access(request, owner_id, token, exp, sig, kind, media_hash, "media")
     # Ownership is checked on every request, not just when the URL was issued.
-    owned = (allowed and kind in MEDIA_DIRS and HASH_REGEX.fullmatch(media_hash)
+    owned = (access is not None and kind in MEDIA_DIRS and HASH_REGEX.fullmatch(media_hash)
              and call("media", owns_media, repository, owner_id, kind, media_hash))
     path = file_store.find_file(MEDIA_DIRS[kind], media_hash) if owned else None
     if path is None:
@@ -394,9 +411,108 @@ def get_media(account_id: str, kind: str, media_hash: str, request: Request,
     # The bytes behind a hash never change, so they can be cached until the URL expires
     # (for one URL lifetime when fetched with the token).
     return FileResponse(path, media_type=content_type, headers={
-        "Cache-Control": f"private, max-age={expires - now}, immutable",
+        "Cache-Control": f"private, max-age={access[0] - int(service.clock())}, immutable",
         "X-Content-Type-Options": "nosniff",
         "Content-Security-Policy": "sandbox",
+    })
+
+
+def _account_ad(service, owner_id, ad_id):
+    """Return the account's ad, or None; another account's ad is as missing as no ad."""
+    ad = service.get_ad(ad_id)
+    return ad if ad is not None and ad.creator_id == owner_id else None
+
+
+def _ad_image(service, ad):
+    """Return (image described with its link and size, whether the creator owns it)."""
+    image = service.repository.get_image(ad.creator_id, ad.image_hash)
+    # Ads published before image ownership was recorded still preview their link image.
+    owned = image is not None
+    image = image or Image(ad.image_hash, ad.creator_id, ad.creation_time)
+    return service.describe_image(image), owned
+
+
+def _stored_media_src(request, access, kind, owner_id, media_hash):
+    """Return a signed URL for stored bytes a browser can show as kind, else None."""
+    path = file_store.find_file(MEDIA_DIRS[kind], media_hash)
+    # Bytes that are not media of that kind (like the sample.jpg placeholder) would show
+    # as a broken element; the page shows a labeled empty box instead.
+    prefix = {"images": "image/", "videos": "video/"}[kind]
+    if path is None or not media_type(path).startswith(prefix):
+        return None
+    expires, token_hash = access
+    return media_url(request, token_hash, kind, owner_id, media_hash, expires)
+
+
+def preview_page(request, owner_id, ad_id, ad_format, access):
+    """Return the HTML preview of the account's ad in ad_format, or None if there is none.
+
+    access is the (expiry, token hash) the request was granted; media links in the page are
+    signed with both, so they never outlive the preview URL or the account's token.
+    """
+    service = request.app.state.service
+    ad = _account_ad(service, owner_id, ad_id)
+    if ad is None or ad_format not in previews.FORMATS:
+        return None
+    account = service.repository.get_account(owner_id)
+    if ad.video_id is not None:
+        video = service.repository.get_video(ad.video_id)
+        kind, src = "video", video and _stored_media_src(request, access, "videos",
+                                                         owner_id, video.video_hash)
+    else:
+        image, owned = _ad_image(service, ad)
+        kind, src = "image", image.image_url or (owned and _stored_media_src(
+            request, access, "images", owner_id, image.hash))
+    return previews.render(ad_format, account.name, ad.text, kind, src or None)
+
+
+@router.get("/accounts/{account_id}/ads/{ad_id}/previews")
+def list_ad_previews(account_id: str, ad_id: str, request: Request,
+                     ad_format: str | None = None, token=Depends(bearer_token),
+                     service=Depends(get_service)):
+    """Signed preview page URLs for the account's ad, one per format, for <iframe> embedding."""
+    owner_id = call("ad", _authenticated_owner, service.repository, account_id, token,
+                    "creator_id")
+    if ad_format is not None and ad_format not in previews.FORMATS:
+        raise ValidationError("002", "ad_format")
+    ad = found(call("ad", _account_ad, service, owner_id, ad_id), "ad_id")
+    width = height = None
+    if ad.image_hash is not None:
+        image = call("image", _ad_image, service, ad)[0]
+        width, height = image.width, image.height
+    token_hash = hash_token(token)
+    return {"data": [
+        {"format": name,
+         "preview_url": signed_url(request, token_hash, owner_id, f"preview:{name}", ad.id,
+                                   "get_ad_preview", ad_id=ad.id, ad_format=name),
+         "width": spec["width"], "height": spec["height"],
+         "warnings": previews.warnings(name, ad.text, width, height)}
+        for name, spec in previews.FORMATS.items() if ad_format in (None, name)]}
+
+
+@router.get("/accounts/{account_id}/ads/{ad_id}/previews/{ad_format}", name="get_ad_preview")
+def get_ad_preview(account_id: str, ad_id: str, ad_format: str, request: Request,
+                   exp: str | None = None, sig: str | None = None, token=Depends(bearer_token)):
+    """Serve the preview page for the account's token, or for a preview URL issued to it."""
+    owner_id = coerce_id(account_id)
+    # The scope names the format, so a URL opens one ad in one format and is never a media URL.
+    access = signed_access(request, owner_id, token, exp, sig, f"preview:{ad_format}", ad_id,
+                           "preview")
+    page = access is not None and call("preview", preview_page, request, owner_id, ad_id,
+                                       ad_format, access)
+    if not page:
+        raise with_status(ValidationError("002", "preview"), 404)
+    origin = f"{request.url.scheme}://{request.url.netloc}"
+    return HTMLResponse(page, headers={
+        # No scripts run, the page gets an opaque origin, and media loads only from this
+        # server (signed URLs) or, for link images, the advertiser's link.
+        "Content-Security-Policy": "sandbox; default-src 'none'; img-src http: https:; "
+                                   f"media-src {origin}; style-src 'unsafe-inline'",
+        "X-Content-Type-Options": "nosniff",
+        # The page URL carries its signature; never send it to a link image's host.
+        "Referrer-Policy": "no-referrer",
+        # Embedded media URLs expire, so a cached page would go stale.
+        "Cache-Control": "no-store",
     })
 
 

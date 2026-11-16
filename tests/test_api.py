@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import struct
@@ -565,6 +566,265 @@ class ApiTests(unittest.TestCase):
         client = TestClient(self.api.create_app(self.service.AdsService(repository),
                                                 admin_key=ADMIN_KEY))
         self.assert_error(client.get("/accounts/1"), 503, "003", "account")
+
+    def previews(self, ad_id=1, token=None, account_id=1, **params):
+        return self.client.get(f"/accounts/{account_id}/ads/{ad_id}/previews", params=params,
+                               headers=self.bearer(token or self.token))
+
+    def preview_urls(self, ad_id=1, token=None):
+        response = self.previews(ad_id, token)
+        self.assertEqual(response.status_code, 200, response.text)
+        return {entry["format"]: entry["preview_url"] for entry in response.json()["data"]}
+
+    def preview_page(self, url, headers=None):
+        response = self.client.get(url, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["content-type"], "text/html; charset=utf-8")
+        # No scripts, an opaque origin, and media only from this server or the image's link.
+        self.assertEqual(response.headers["content-security-policy"],
+                         "sandbox; default-src 'none'; img-src http: https:; "
+                         "media-src http://testserver; style-src 'unsafe-inline'")
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        return response.text
+
+    @staticmethod
+    def media_sources(page):
+        return [src.replace("&amp;", "&") for src in re.findall(r'src="([^"]*)"', page)]
+
+    def test_ad_previews_list_every_format(self):
+        square, landscape = self.seeded[0], self.seeded[1]  # 1080x1080 and 1200x628.
+        self.assertEqual(self.publish_ad(image=square["url"]).status_code, 201)
+        response = self.previews()
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()["data"]
+        urls = [entry.pop("preview_url") for entry in data]
+        # VALID_TEXT is longer than a banner's 40 characters.
+        self.assertEqual(data, [
+            {"format": "feed", "width": 500, "height": 640, "warnings": []},
+            {"format": "story", "width": 360, "height": 640, "warnings": ["media_cropped"]},
+            {"format": "banner", "width": 600, "height": 354,
+             "warnings": ["text_truncated", "media_cropped"]},
+        ])
+        for url, name in zip(urls, ("feed", "story", "banner")):
+            self.assertTrue(url.startswith(f"http://testserver/accounts/1/ads/1/previews/{name}"
+                                           f"?exp={self.now + 600}&sig="), url)
+        response = self.previews(ad_format="banner")
+        self.assertEqual([entry["format"] for entry in response.json()["data"]], ["banner"])
+        long_text = "Fresh picks " * 11
+        self.assertEqual(self.publish_ad(image=landscape["url"], text=long_text).status_code, 201)
+        warnings = {entry["format"]: entry["warnings"] for entry in self.previews(2).json()["data"]}
+        self.assertEqual(warnings, {"feed": ["text_truncated", "media_cropped"],
+                                    "story": ["text_truncated", "media_cropped"],
+                                    "banner": ["text_truncated"]})
+        # A video's size is unknown, so nothing is reported as cropped.
+        self.assertEqual(self.upload_video(MP4).status_code, 201)
+        self.assertEqual(self.publish_ad(video_id=1, text="Watch now").status_code, 201)
+        warnings = [entry["warnings"] for entry in self.previews(3).json()["data"]]
+        self.assertEqual(warnings, [[], [], []])
+
+    def test_preview_pages_render_each_format(self):
+        link = self.seeded[0]
+        self.assertEqual(self.publish_ad(image=link["url"]).status_code, 201)
+        page = self.preview_page(self.preview_urls()["feed"])
+        self.assertIn("<strong>Advertiser One</strong>", page)
+        self.assertIn("Sponsored", page)
+        self.assertIn(f"<p class=\"text\">{VALID_TEXT}</p>", page)
+        # A link image is shown from its link.
+        self.assertIn(f'<img class="media" src="{link["url"]}" alt="Ad image">', page)
+        # Uploaded bytes are shown through a signed media URL.
+        image_hash = self.upload_image(PNG).json()["hash"]
+        self.assertEqual(self.publish_ad(image_hash=image_hash).status_code, 201)
+        for name, url in self.preview_urls(2).items():
+            with self.subTest(format=name):
+                [src] = self.media_sources(self.preview_page(url))
+                self.assertTrue(src.startswith(
+                    f"http://testserver/accounts/1/media/images/{image_hash}?exp="), src)
+                self.assert_media(src, PNG, "image/png")
+        # Video plays muted in every format; only the story autoplays.
+        self.assertEqual(self.upload_video(MP4).status_code, 201)
+        self.assertEqual(self.publish_ad(video_id=1).status_code, 201)
+        pages = {name: self.preview_page(url) for name, url in self.preview_urls(3).items()}
+        self.assertIn("autoplay muted loop playsinline", pages["story"])
+        for name in ("feed", "banner"):
+            self.assertIn("controls muted playsinline", pages[name])
+            self.assertNotIn("autoplay", pages[name])
+        for page in pages.values():
+            [src] = self.media_sources(page)
+            self.assert_media(src, MP4, "video/mp4")
+        # Bytes no browser can show render a labeled empty box.
+        placeholder = self.upload_image(b"not an image").json()["hash"]
+        self.assertEqual(self.publish_ad(image_hash=placeholder).status_code, 201)
+        page = self.preview_page(self.preview_urls(4)["feed"])
+        self.assertEqual(self.media_sources(page), [])
+        self.assertIn('role="img" aria-label="Media unavailable"', page)
+        # Long text is cut per format; the feed offers "See more".
+        long_text = "Fresh picks " * 11
+        self.assertEqual(self.publish_ad(text=long_text).status_code, 201)
+        urls = self.preview_urls(5)
+        self.assertIn(f"{long_text[:125].rstrip()}… <span class=\"more\">See more</span>",
+                      self.preview_page(urls["feed"]))
+        banner = self.preview_page(urls["banner"])
+        self.assertIn(f"{long_text[:40].rstrip()}…</p>", banner)
+        self.assertNotIn("See more", banner)
+
+    def test_preview_page_escapes_advertiser_text(self):
+        rename = self.client.patch("/accounts/1", json={"name": "<i>One</i>"},
+                                   headers=self.bearer(self.token))
+        self.assertEqual(rename.status_code, 200, rename.text)
+        text = '<img src=x onerror=alert(1)> & "deal"'
+        self.assertEqual(self.publish_ad(text=text).status_code, 201)
+        page = self.preview_page(self.preview_urls()["feed"])
+        self.assertNotIn("<img src=x", page)
+        self.assertNotIn("<i>One</i>", page)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt; &amp; &quot;deal&quot;", page)
+        self.assertIn("&lt;i&gt;One&lt;/i&gt;", page)
+        # Links may contain quotes; they cannot leave the src attribute.
+        link = 'https://cdn.example.com/a"onerror="alert(1)'
+        self.assertEqual(self.publish_ad(image=link).status_code, 201)
+        page = self.preview_page(self.preview_urls(2)["feed"])
+        self.assertIn('src="https://cdn.example.com/a&quot;onerror=&quot;alert(1)"', page)
+
+    def test_preview_never_links_media_the_account_does_not_own(self):
+        # An ad saved before ownership was recorded, naming bytes another account uploaded.
+        other_token = self.create_account(2, "Advertiser Two")
+        image_hash = self.client.post("/accounts/2/images", content=PNG,
+                                      params={"filename": "a.png"},
+                                      headers=self.bearer(other_token)).json()["hash"]
+        draft = self.models.AdDraft(1, VALID_TEXT, image_hash=image_hash)
+        self.client.app.state.service.repository.save_ad(draft, self.now)
+        page = self.preview_page(self.preview_urls()["feed"])
+        self.assertEqual(self.media_sources(page), [])
+        self.assertIn('aria-label="Media unavailable"', page)
+
+    def test_ad_previews_errors(self):
+        other_token = self.create_account(2, "Advertiser Two")
+        self.assertEqual(self.publish_ad().status_code, 201)
+        theirs = self.client.post("/accounts/2/ads", headers=self.bearer(other_token),
+                                  json={"text": VALID_TEXT, "image": self.seeded[0]["url"]})
+        self.assertEqual(theirs.json(), {"id": 2})
+        self.assert_error(self.client.get("/accounts/1/ads/1/previews"), 401, "002",
+                          "access_token")
+        # Only a bearer token authenticates; another scheme carrying the token does not.
+        for scheme in ("Basic", "Token"):
+            with self.subTest(scheme=scheme):
+                self.assert_error(self.client.get("/accounts/1/ads/1/previews", headers={
+                    "Authorization": f"{scheme} {self.token}"}), 401, "002", "access_token")
+        for token in ("wrong", other_token):
+            with self.subTest(token=token):
+                self.assert_error(self.previews(token=token), 401, "002", "access_token")
+        self.assert_error(self.previews(account_id=9), 400, "002", "creator_id")
+        # Another account's ad is as missing as no ad.
+        for ad_id in (2, 99, "abc"):
+            with self.subTest(ad_id=ad_id):
+                self.assert_error(self.previews(ad_id), 404, "002", "ad_id")
+        self.assert_error(self.previews(ad_format="carousel"), 400, "002", "ad_format")
+
+    def test_previews_need_an_issued_token(self):
+        # An account created before authentication has no token, so nothing authenticates.
+        self.assertEqual(self.publish_ad().status_code, 201)
+        with sqlite3.connect(self.publish.DB_PATH) as conn:
+            conn.execute("UPDATE accounts SET token_hash = NULL WHERE id = 1")
+        self.assert_error(self.previews(), 401, "002", "access_token")
+        self.assert_error(self.client.get("/accounts/1/ads/1/previews/feed",
+                                          headers=self.bearer(self.token)),
+                          401, "002", "access_token")
+        # A URL signed over the missing token hash opens nothing either.
+        exp = self.now + 600
+        sig = self.api.media_signature(MEDIA_KEY, 1, "preview:feed", "1", exp, None)
+        self.assert_error(self.client.get(f"/accounts/1/ads/1/previews/feed?exp={exp}&sig={sig}"),
+                          404, "002", "preview")
+        new_token = self.client.app.state.service.issue_access_token(1)
+        self.preview_page(self.preview_urls(token=new_token)["feed"])
+
+    def test_preview_url_grants_nothing_past_its_expiry(self):
+        image_hash = self.upload_image(PNG).json()["hash"]
+        self.assertEqual(self.publish_ad(image_hash=image_hash).status_code, 201)
+        url = self.preview_urls()["feed"]
+        expires = self.now + 600
+        # Opened just before it expires, the page's media links expire with it.
+        self.now += 590
+        [src] = self.media_sources(self.preview_page(url))
+        self.assertIn(f"?exp={expires}&sig=", src)
+        self.assert_media(src, PNG, "image/png")
+        self.now += 10
+        self.assert_error(self.client.get(url), 404, "002", "preview")
+        self.assert_error(self.client.get(src), 404, "002", "media")
+        # A preview signature never opens media, even for content the account owns.
+        query = url.partition("?")[2]
+        self.assert_error(self.client.get(f"/accounts/1/media/images/{image_hash}?{query}"),
+                          404, "002", "media")
+
+    def test_preview_urls_reject_tampering_and_expiry(self):
+        other_token = self.create_account(2, "Advertiser Two")
+        for _ in range(2):
+            self.assertEqual(self.publish_ad().status_code, 201)
+        theirs = self.client.post("/accounts/2/ads", headers=self.bearer(other_token),
+                                  json={"text": VALID_TEXT, "image": self.seeded[0]["url"]})
+        self.assertEqual(theirs.json(), {"id": 3})
+        url = self.preview_urls()["feed"]
+        path, _, query = url.removeprefix("http://testserver").partition("?")
+        params = dict(pair.split("=") for pair in query.split("&"))
+        exp = params["exp"]
+        sign = lambda kind, subject: self.api.media_signature(
+            MEDIA_KEY, 1, kind, subject, exp, self.validation.hash_token(self.token))
+        bad = [
+            path,  # No signature.
+            f"{path}?exp={exp}",
+            f"{path}?exp={exp}&sig={'0' * 64}",
+            f"{path}?exp={int(exp) + 1}&sig={params['sig']}",  # Extended expiry.
+            f"/accounts/1/ads/1/previews/story?{query}",  # Reused for another format,
+            f"/accounts/1/ads/2/previews/feed?{query}",  # ... another ad,
+            f"/accounts/2/ads/1/previews/feed?{query}",  # ... or another account.
+            f"{path}?exp={exp}&sig={sign('images', '1')}",  # A media signature.
+            # Correctly signed, but the ad is missing, another account's, or the format unknown.
+            f"/accounts/1/ads/99/previews/feed?exp={exp}&sig={sign('preview:feed', '99')}",
+            f"/accounts/1/ads/3/previews/feed?exp={exp}&sig={sign('preview:feed', '3')}",
+            f"/accounts/1/ads/1/previews/carousel?exp={exp}&sig={sign('preview:carousel', '1')}",
+        ]
+        for candidate in bad:
+            with self.subTest(url=candidate):
+                self.assert_error(self.client.get(candidate), 404, "002", "preview")
+        self.now += 599
+        self.preview_page(url)
+        self.now += 1  # Expired at exactly exp.
+        self.assert_error(self.client.get(url), 404, "002", "preview")
+        # Reissuing the token revokes every preview URL issued under the old one.
+        url = self.preview_urls()["feed"]
+        new_token = self.client.app.state.service.issue_access_token(1)
+        self.assert_error(self.client.get(url), 404, "002", "preview")
+        self.preview_page(self.preview_urls(token=new_token)["feed"])
+        # The account's token works without a signature; a wrong one is a 401.
+        self.preview_page(path, headers=self.bearer(new_token))
+        for token in ("wrong", other_token):
+            with self.subTest(token=token):
+                self.assert_error(self.client.get(path, headers=self.bearer(token)), 401, "002",
+                                  "access_token")
+        self.assert_error(self.client.get("/accounts/1/ads/3/previews/feed",
+                                          headers=self.bearer(new_token)), 404, "002", "preview")
+
+    def test_no_media_key_means_no_preview_urls(self):
+        image_hash = self.upload_image(PNG).json()["hash"]
+        self.assertEqual(self.publish_ad(image_hash=image_hash).status_code, 201)
+        url = self.preview_urls()["feed"]
+        self.client = self.make_client(None)
+        self.assertEqual(set(self.preview_urls().values()), {None})
+        self.assert_error(self.client.get(url), 404, "002", "preview")
+        # The token still opens the page, but its stored media cannot be linked.
+        page = self.preview_page("/accounts/1/ads/1/previews/feed",
+                                 headers=self.bearer(self.token))
+        self.assertEqual(self.media_sources(page), [])
+        self.assertIn('aria-label="Media unavailable"', page)
+
+    def test_preview_storage_failure_is_503(self):
+        self.assertEqual(self.publish_ad().status_code, 201)
+        url = self.preview_urls()["feed"]
+        service = self.client.app.state.service
+        with patch.object(service.repository, "get_ad",
+                          side_effect=sqlite3.OperationalError("disk I/O error")):
+            self.assert_error(self.previews(), 503, "003", "ad")
+            self.assert_error(self.client.get(url), 503, "003", "preview")
 
 
 if __name__ == "__main__":

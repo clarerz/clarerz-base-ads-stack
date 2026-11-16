@@ -5,10 +5,12 @@ handling, configuration from the environment, and persistence across a restart.
 """
 
 import hashlib
+import html
 import http.client
 import json as jsonlib
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 import subprocess
@@ -32,11 +34,14 @@ ADMIN_KEY = "e2e-admin"
 MEDIA_KEY = "e2e-media"
 # A PNG header declaring 2x3 pixels: enough for the size and the sniffed type.
 PNG = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 2, 3) + b"\x08\x02\x00\x00\x00"
+MP4 = b"\x00\x00\x00\x18ftypmp42" + bytes(range(64))
 SEEDED_URL = jsonlib.loads((BASE_DIR / "images.json").read_text())[0]["url"]
 ROUTES = {"/accounts", "/accounts/{account_id}", "/accounts/{account_id}/ads",
           "/accounts/{account_id}/images", "/accounts/{account_id}/videos", "/ads/{ad_id}",
           "/videos/{video_id}", "/accounts/{account_id}/images/lookup",
-          "/accounts/{account_id}/media/{kind}/{media_hash}"}
+          "/accounts/{account_id}/media/{kind}/{media_hash}",
+          "/accounts/{account_id}/ads/{ad_id}/previews",
+          "/accounts/{account_id}/ads/{ad_id}/previews/{ad_format}"}
 
 
 def request(method, url, *, json=None, data=None, token=None):
@@ -67,6 +72,22 @@ def fetch(url, token=None):
     except urllib.error.HTTPError as exc:
         with exc:
             return exc.code, exc.headers["Content-Type"], exc.read()
+
+
+def fetch_page(url, token=None):
+    """Return (status, headers, decoded body) for a GET; HTTP errors are returned."""
+    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                    timeout=10) as response:
+            return response.status, response.headers, response.read().decode()
+    except urllib.error.HTTPError as exc:
+        with exc:
+            return exc.code, exc.headers, exc.read().decode()
+
+
+def media_sources(page):
+    return [html.unescape(src) for src in re.findall(r'src="([^"]*)"', page)]
 
 
 class ApiEndToEndTests(unittest.TestCase):
@@ -232,6 +253,104 @@ class ApiEndToEndTests(unittest.TestCase):
         _, image = request("GET", f"{url}/accounts/1/images/lookup?image_hash={image_hash}",
                            token=new_token)
         self.assertEqual(fetch(image["preview_url"]), (200, "image/png", PNG))
+
+    def preview_urls(self, url, token, ad_id):
+        status, body = request("GET", f"{url}/accounts/1/ads/{ad_id}/previews", token=token)
+        self.assertEqual(status, 200, body)
+        return {entry["format"]: entry["preview_url"] for entry in body["data"]}
+
+    def assert_preview_page(self, url, preview_url, token=None):
+        """Fetch a preview page as a browser would and return its HTML."""
+        status, headers, page = fetch_page(preview_url, token)
+        self.assertEqual(status, 200, page[:200])
+        self.assertEqual(headers["Content-Type"], "text/html; charset=utf-8")
+        # media-src names the host the client called, so the page's media links load.
+        self.assertEqual(headers["Content-Security-Policy"],
+                         "sandbox; default-src 'none'; img-src http: https:; "
+                         f"media-src {url}; style-src 'unsafe-inline'")
+        self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        return page
+
+    def test_ad_previews_end_to_end(self):
+        _, url = self.start_server(self.data_dir, media_key=MEDIA_KEY)
+        token, other_token = self.create_account(url), self.create_account(url, 2)
+        image_hash = self.upload_image(url, 1, token, PNG)
+        status, body = request("POST", f"{url}/accounts/1/videos?filename=v.mp4&name=Promo",
+                               data=MP4, token=token)
+        self.assertEqual(status, 201, body)
+        for creative in ({"image_hash": image_hash}, {"video_id": 1}, {"image": SEEDED_URL}):
+            status, body = request("POST", f"{url}/accounts/1/ads",
+                                   json={"text": VALID_TEXT, **creative}, token=token)
+            self.assertEqual(status, 201, body)
+
+        # Listing previews needs the account's own bearer token.
+        for wrong in (None, "wrong", other_token):
+            with self.subTest(token=wrong):
+                status, body = request("GET", f"{url}/accounts/1/ads/1/previews", token=wrong)
+                self.assertEqual((status, body["error_code"]), (401, "002"))
+
+        # Image ad: every format's page embeds a signed media URL serving the uploaded bytes.
+        status, body = request("GET", f"{url}/accounts/1/ads/1/previews", token=token)
+        self.assertEqual(status, 200, body)
+        self.assertEqual([(entry["format"], entry["width"], entry["height"])
+                          for entry in body["data"]],
+                         [("feed", 500, 640), ("story", 360, 640), ("banner", 600, 354)])
+        for entry in body["data"]:
+            with self.subTest(format=entry["format"]):
+                self.assertTrue(entry["preview_url"].startswith(
+                    f"{url}/accounts/1/ads/1/previews/{entry['format']}?exp="), entry)
+                [src] = media_sources(self.assert_preview_page(url, entry["preview_url"]))
+                self.assertTrue(src.startswith(f"{url}/accounts/1/media/images/{image_hash}?"))
+                self.assertEqual(fetch(src), (200, "image/png", PNG))
+
+        # Video ad: the story autoplays the uploaded video.
+        page = self.assert_preview_page(url, self.preview_urls(url, token, 2)["story"])
+        self.assertIn("autoplay muted loop playsinline", page)
+        [src] = media_sources(page)
+        self.assertEqual(fetch(src), (200, "video/mp4", MP4))
+
+        # Link ad: the page shows the image from its link.
+        page = self.assert_preview_page(url, self.preview_urls(url, token, 3)["banner"])
+        self.assertEqual(media_sources(page), [SEEDED_URL])
+
+        # Server-side clients open the page with the token; another account's token is a 401.
+        self.assert_preview_page(url, f"{url}/accounts/1/ads/1/previews/feed", token)
+        status, _, body = fetch_page(f"{url}/accounts/1/ads/1/previews/feed", other_token)
+        self.assertEqual((status, jsonlib.loads(body)["error_code"]), (401, "002"))
+        # A tampered signature opens nothing.
+        status, _, body = fetch_page(self.preview_urls(url, token, 1)["feed"]
+                                     .replace("sig=", "sig=0"))
+        self.assertEqual((status, jsonlib.loads(body)["error_code"]), (404, "002"))
+
+    def test_ad_preview_urls_shared_across_processes_until_token_reissued(self):
+        _, url = self.start_server(self.data_dir, media_key=MEDIA_KEY)
+        token = self.create_account(url)
+        image_hash = self.upload_image(url, 1, token, PNG)
+        status, body = request("POST", f"{url}/accounts/1/ads",
+                               json={"text": VALID_TEXT, "image_hash": image_hash}, token=token)
+        self.assertEqual(status, 201, body)
+        preview_url = self.preview_urls(url, token, 1)["feed"]
+        # Another worker with the same key opens the URL; one with another key does not.
+        _, same_key = self.start_server(self.data_dir, media_key=MEDIA_KEY)
+        _, other_key = self.start_server(self.data_dir, media_key="other-media")
+        on = lambda server, link: link.replace(url, server)
+        [src] = media_sources(self.assert_preview_page(same_key, on(same_key, preview_url)))
+        self.assertEqual(fetch(src), (200, "image/png", PNG))
+        status, _, _ = fetch_page(on(other_key, preview_url))
+        self.assertEqual(status, 404)
+        # Reissuing the token from another process revokes the page and its media links on
+        # every running server.
+        load_isolated_modules(self, self.data_dir)
+        new_token = self.service.AdsService(
+            self.repository.SQLiteAdsRepository(self.publish.DB_PATH)).issue_access_token(1)
+        for server in (url, same_key):
+            with self.subTest(server=server):
+                status, _, _ = fetch_page(on(server, preview_url))
+                self.assertEqual(status, 404)
+                self.assert_not_found(fetch(on(server, src)))
+        self.assert_preview_page(url, self.preview_urls(url, new_token, 1)["feed"])
 
     def test_data_survives_server_restart(self):
         process, url = self.start_server(self.data_dir)

@@ -18,7 +18,7 @@
 
 ## Coverage
 
-111 standard-library test methods (149 with the HTTP API suites), with parameterized subtests, cover:
+111 standard-library test methods (161 with the HTTP API suites), with parameterized subtests, cover:
 
 | Area | Checks |
 | --- | --- |
@@ -29,6 +29,7 @@
 | Uploads | Content hashes, durable copies in the data directory, one copy per content even across suffixes and concurrent uploads, known content found by hash before any write (including older `<hash><suffix>` files), sources that change while being stored rejected, HTTP 409 `004` for an account's own byte-identical re-uploads but not for other accounts', real 30 MiB image boundary, video size limit, partial-copy cleanup, image and video extensions, unreadable sources as invalid input, header dimensions for PNG, GIF, JPEG, and WEBP with a bounded JPEG walk, input validation before storage. |
 | Listings | Ads, videos, and images: newest-first keyset pagination, tie order, stability across new rows, inclusive/exclusive time filters combined with cursors, invalid parameters, storage failures; image URL, stored dimensions, and the pre-cutoff placeholder; single-image fetch by hash or name. |
 | Previews | Image lookup by hash and name, `preview_url` on image and video listings and video routes, link images previewed by source URL, served bytes with sniffed content types, `Range`, cache lifetime bounded by expiry, security headers; media served only under the owning account, by its token (other and wrong tokens 401) or a URL signed for it; media it does not own 404 even when the bytes are stored; missing, altered, extended, reused (other content, kind, or account), wrong-key, revoked (token reissued), and expired signatures and missing files all 404; no key means no previews, but the token still works. |
+| Ad previews | Every format listed with its size and warnings (cut text, cropped images, none for videos), one format by `ad_format`; pages render link images by link, uploaded images and videos through signed media URLs, video playback per format, a labeled box for unshowable or unowned bytes, per-format text cuts; ad text, account names, and links escaped; page security headers; token required (missing, wrong, other accounts', and non-Bearer tokens 401; accounts with no issued token cannot preview, even with a URL signed over the missing hash), unknown account 400, other accounts' and missing ads 404, unknown format 400; missing, altered, extended, reused (other format, ad, or account, or a media signature), revoked, and expired signatures 404; a preview signature never opens media; media links in a page expire with its preview URL; bearer access to the page; no key means no URLs; storage failures 503. End to end against a real server: image, video, and link ads previewed in every format with their embedded media fetched over HTTP, the CSP `media-src` matching the real host, token rules on both routes, and preview URLs (with their media links) shared across processes until a token reissued in another process revokes them. |
 | Reads | Full objects, projections of every supported shape including comma-separated strings, invalid projections, missing records, `get_video`. |
 | Image registry | Seeded records, unreadable seed file fails loudly, metadata-only URL ingestion, damaged registry left untouched, interrupted writes keep the previous registry, concurrent URL and file ingestions from several processes all kept. |
 | Extensibility | Extra validation rules, custom publish stage, injected image storage and clock (shared by the service and its default publisher), custom upload and video validators, validator using the publisher's storage. |
@@ -56,6 +57,11 @@ every mutation below produced failures:
 - Skip the preview signature or expiry check, leave the kind or token hash out of the
   signature, skip the media ownership check or token authentication, or drop `nosniff`.
 - Skip the video extension check, or raise from `rename_video` on storage failure.
+- In ad previews: leave ad text or a media link unescaped, sign without the format,
+  preview another account's ad, link unowned or unshowable bytes, drop
+  `Referrer-Policy`, stop the story autoplaying, or skip the crop warning; skip the
+  listing's token check or the page's bearer check, accept expired or tokenless signatures,
+  or let page media links outlive the preview URL.
 
 Later fixes were each test-first: the new test failed against the previous
 code and passed after the change. Commit reviewers also confirmed by mutation

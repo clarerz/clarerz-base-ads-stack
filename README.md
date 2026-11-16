@@ -96,6 +96,8 @@ use the same `{"error_code", "error_message"}` body.
 | `GET` | `/videos/{video_id}` | Account token | 200 video |
 | `PATCH` | `/videos/{video_id}` (`{"name"}`) | Account token | 200 video |
 | `GET` | `/accounts/{account_id}/media/{images\|videos}/{hash}?exp&sig` | Account token or signed URL | 200 file bytes |
+| `GET` | `/accounts/{account_id}/ads/{ad_id}/previews?ad_format=` | Account token | 200 `{"data": [{"format", "preview_url", "width", "height", "warnings"}]}` |
+| `GET` | `/accounts/{account_id}/ads/{ad_id}/previews/{feed\|story\|banner}?exp&sig` | Account token or signed URL | 200 HTML page |
 
 Status codes: `001` and `002` errors return 400, except `002` for
 `access_token` (a missing or wrong token or admin key), which returns 401. A
@@ -136,6 +138,52 @@ bytes (PNG, GIF, JPEG, WEBP, MP4, MOV, WebM, Matroska, AVI); anything else, such
 as the placeholder `sample.jpg`, is served as `application/octet-stream`. URLs are
 absolute, built from the request's host; behind a proxy, run uvicorn with
 `--proxy-headers` so they name the public host.
+
+### Ad previews
+
+`GET /accounts/{account_id}/ads/{ad_id}/previews` shows how one of the account's ads
+renders in each format. It returns data, not markup: each entry's `preview_url` is a
+signed link to a static HTML page, and a client embeds it with
+`<iframe src="{preview_url}" width="{width}" height="{height}" title="Ad preview">`.
+`?ad_format=` returns one format. Nothing is rendered until the page is fetched.
+
+| Format | Page (CSS px) | Media frame | Text |
+| --- | --- | --- | --- |
+| `feed` | 500×640 | 500×500 (1:1), below the account name and text | Cut at 125 characters with "See more" |
+| `story` | 360×640 | Full page (9:16); text over a gradient, clear of the top and bottom safe zones | Cut at 125 characters |
+| `banner` | 600×354 | 600×314 (1.91:1), above one line of text | Cut at 40 characters |
+
+Media fills its frame and is cropped to fit. Videos play muted; the story autoplays and
+loops, and the others show the first frame with controls. `warnings` lists
+`text_truncated` when the ad's text is cut and `media_cropped` when the image's known
+size is more than 1% away from the frame's aspect ratio; video sizes are unknown, so
+videos never report it.
+
+The listing needs the account's token, like image and video listings: previews link
+the account's stored bytes, which are otherwise served only to the owner. An unknown
+account returns 400 with `002` for `creator_id`; another account's ad and a missing ad
+both return 404 with `002` for `ad_id`; an unknown format returns 400 with `002` for
+`ad_format`.
+
+Preview URLs use the same signing as media URLs, scoped to one ad in one format, and
+expire after `api.PREVIEW_SECONDS`; issuing the account a new token revokes them.
+Server-side clients can fetch the page path with the account's bearer token instead (a
+wrong token, or a token sent with another scheme than `Bearer`, returns 401; an account
+with no issued token cannot preview). A missing, expired, altered, revoked, or reused signature,
+an unknown format, and an ad the account does not own all return 404 with `002` for
+`preview`. Without `ADS_MEDIA_KEY`, `preview_url` is `null`, and pages fetched with the
+token show stored media as unavailable.
+
+The page is static HTML that runs no scripts, with every ad and account value
+HTML-escaped. Uploaded images and videos appear through media URLs signed when the page
+is rendered, link images through their link. Those media URLs expire with the preview
+URL that opened the page, so a preview URL grants nothing past its own expiry. Media that cannot be shown (no stored
+bytes a browser can display, such as the `sample.jpg` placeholder, or bytes the account
+does not own) appears as a labeled "Media unavailable" box. Pages are served with
+`Content-Security-Policy: sandbox; default-src 'none'; img-src http: https:; media-src
+<this server>; style-src 'unsafe-inline'`, `Referrer-Policy: no-referrer` (the page URL
+carries its signature), `X-Content-Type-Options: nosniff`, and `Cache-Control:
+no-store`. Ads are previewed by ID only; ads have no names.
 
 The image lookup takes exactly one of `image_hash` or `image_name` and follows
 `get_image` in the Python API; a missing image, another account's image, and a
@@ -279,6 +327,7 @@ and metadata. The existing functions in `publish.py` still return dictionaries.
 | `file_store.py` | Size-limited copy of a local file into storage, named by content hash. |
 | `video_store.py` | Local video storage on top of `file_store`. |
 | `publish.py` | Compatibility API that translates objects and errors into dictionaries. |
+| `previews.py` | Ad preview formats, their warnings, and escaped static HTML pages. |
 | `api.py` | FastAPI HTTP API over `AdsService`; maps errors to HTTP status codes. |
 
 Use the object API to work directly with accounts and ads:
@@ -421,14 +470,17 @@ without them. Run every suite from the virtual environment:
 it over HTTP, covering chunked uploads, configuration from the environment,
 persistence across a server restart, and media access: owner-only by token or signed
 URL, URLs valid across processes sharing a key, and revocation when another process
-reissues the token.
+reissues the token. Ad previews are driven the way a browser would use them: list an
+ad's previews with the token, open each page by its signed URL, check its headers
+(including a `media-src` naming the real host), and fetch every media link it embeds,
+across server processes and after a token reissued elsewhere.
 
 The tests use temporary storage and include fresh-process persistence checks.
 They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The standard-library suite has 111 tests (149 with the HTTP API suites), including boundary cases, storage failures, rollback,
+The standard-library suite has 111 tests (161 with the HTTP API suites), including boundary cases, storage failures, rollback,
 schema migrations, concurrent SQLite ad ID allocation and registry writes, token
 and ownership enforcement, size limits, and ad, video, and image listings. See
 [VERIFICATION.md](VERIFICATION.md) for the test audit, deliberate regression

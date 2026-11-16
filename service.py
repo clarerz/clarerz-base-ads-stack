@@ -97,7 +97,7 @@ class AdsService:
         authenticate(self.repository, owner_id, access_token)
         # Fetch one extra row to learn whether another page exists.
         images = self.repository.list_images(owner_id, limit + 1, after, since, until)
-        page = [self._describe(image) for image in images[:limit]]
+        page = [self.describe_image(image) for image in images[:limit]]
         return page, encode_image_cursor(page[-1]) if len(images) > limit else None
 
     def get_image(self, owner_id, access_token, image_hash=None, image_name=None):
@@ -109,9 +109,9 @@ class AdsService:
         if image is None:
             # Unknown images and other accounts' images get the same error.
             raise ValidationError("002", "image_hash" if image_hash is not None else "image_name")
-        return self._describe(image)
+        return self.describe_image(image)
 
-    def _describe(self, image):
+    def describe_image(self, image):
         """Add the stored URL and dimensions to an owned image."""
         # ponytail: one registry lookup (a full JSON parse) per listed image; read the
         # registry once per page if listings get slow.
