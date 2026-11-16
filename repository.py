@@ -5,7 +5,7 @@ from pathlib import Path
 import sqlite3
 from typing import Optional, Protocol
 
-from models import Ad, AdAccount, AdDraft, Image, Video
+from models import Ad, AdAccount, AdDraft, Image, User, Video
 
 
 class AdsRepository(Protocol):
@@ -32,9 +32,18 @@ class AdsRepository(Protocol):
     def rename_video(self, video_id: int, name: str) -> Optional[Video]: ...
     def list_videos(self, owner_id: int, limit: int, after: Optional[tuple] = None,
                     since: Optional[int] = None, until: Optional[int] = None) -> list: ...
+    def create_user(self, user: User) -> Optional[str]: ...
+    def get_user(self, account_id: Optional[int] = None,
+                 username: Optional[str] = None) -> Optional[User]: ...
+    def record_login(self, account_id: int, succeeded: bool, now: int) -> None: ...
+    def create_session(self, token_hash: str, account_id: int, expires_at: int, now: int,
+                       replaces: Optional[str] = None) -> None: ...
+    def get_session(self, token_hash: str) -> Optional[tuple]: ...
+    def delete_sessions(self, now: Optional[int] = None,
+                        token_hash: Optional[str] = None) -> None: ...
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SQLiteAdsRepository:
@@ -60,6 +69,8 @@ class SQLiteAdsRepository:
                     self._create_v1(conn)
                 if version < 2:
                     self._create_v2(conn)
+                if version < 3:
+                    self._create_v3(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except BaseException:
@@ -103,6 +114,18 @@ class SQLiteAdsRepository:
         # list_ads filters by creator and pages by (creation_time, id).
         conn.execute("CREATE INDEX IF NOT EXISTS ads_by_creator_time "
                      "ON ads (creator_id, creation_time)")
+
+    def _create_v3(self, conn):
+        # Web logins: one per account (the primary key), usernames unique in any case.
+        conn.execute("CREATE TABLE IF NOT EXISTS users (account_id INTEGER PRIMARY KEY, "
+                     "username TEXT NOT NULL COLLATE NOCASE, password_hash TEXT NOT NULL, "
+                     "token_hash TEXT NOT NULL, failed_logins INTEGER NOT NULL DEFAULT 0, "
+                     "last_failure INTEGER NOT NULL DEFAULT 0)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_by_username ON users (username)")
+        # Only each session token's hash is stored.
+        conn.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, "
+                     "account_id INTEGER NOT NULL, expires_at INTEGER NOT NULL)")
+        conn.execute("CREATE INDEX IF NOT EXISTS sessions_by_account ON sessions (account_id)")
 
     @staticmethod
     def _add_column(conn, table, column):
@@ -280,6 +303,86 @@ class SQLiteAdsRepository:
                 f"ORDER BY {time_column} DESC, {key_column} DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
+
+    def create_user(self, user):
+        """Store user as its account's login; return None, or the field that prevents it.
+
+        "access_token": user.token_hash is no longer the account's token. "account_id": the
+        account already has a login claimed with its current token. "username": another
+        account uses the name. A login claimed with an older token is replaced, and its
+        sessions are deleted. Checked and written in one write transaction, so concurrent
+        sign-ups cannot both succeed.
+        """
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT token_hash FROM accounts WHERE id = ?",
+                                   (user.account_id,)).fetchone()
+            if current is None or current[0] != user.token_hash:
+                return "access_token"
+            existing = conn.execute("SELECT token_hash FROM users WHERE account_id = ?",
+                                    (user.account_id,)).fetchone()
+            if existing is not None and existing[0] == user.token_hash:
+                return "account_id"
+            if conn.execute("SELECT 1 FROM users WHERE username = ? AND account_id != ?",
+                            (user.username, user.account_id)).fetchone():
+                return "username"
+            conn.execute("DELETE FROM sessions WHERE account_id = ?", (user.account_id,))
+            conn.execute(
+                "INSERT OR REPLACE INTO users (account_id, username, password_hash, token_hash, "
+                "failed_logins, last_failure) VALUES (?, ?, ?, ?, ?, ?)",
+                (user.account_id, user.username, user.password_hash, user.token_hash,
+                 user.failed_logins, user.last_failure),
+            )
+        return None
+
+    def get_user(self, account_id=None, username=None):
+        """Return the login of this account, or with this username (any case) if no ID is given."""
+        column, value = (("account_id", account_id) if account_id is not None
+                         else ("username", username))
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT account_id, username, password_hash, token_hash, "
+                               f"failed_logins, last_failure FROM users WHERE {column} = ?",
+                               (value,)).fetchone()
+        return User(*row) if row is not None else None
+
+    def record_login(self, account_id, succeeded, now):
+        """Reset the login's consecutive failures, or count one more at now."""
+        with closing(self._connect()) as conn, conn:
+            if succeeded:
+                conn.execute("UPDATE users SET failed_logins = 0 WHERE account_id = ?",
+                             (account_id,))
+            else:
+                conn.execute("UPDATE users SET failed_logins = failed_logins + 1, "
+                             "last_failure = ? WHERE account_id = ?", (now, account_id))
+
+    def create_session(self, token_hash, account_id, expires_at, now, replaces=None):
+        """Store a session; delete expired sessions and the session it replaces."""
+        with closing(self._connect()) as conn, conn:
+            self._delete_sessions(conn, now, replaces)
+            conn.execute("INSERT INTO sessions (token_hash, account_id, expires_at) "
+                         "VALUES (?, ?, ?)", (token_hash, account_id, expires_at))
+
+    def get_session(self, token_hash):
+        """Return (account_id, expires_at) if the session's login is current, else None."""
+        # A token reissued since the login was claimed ends the login and all its sessions.
+        with closing(self._connect()) as conn:
+            return conn.execute(
+                "SELECT s.account_id, s.expires_at FROM sessions s "
+                "JOIN users u ON u.account_id = s.account_id "
+                "JOIN accounts a ON a.id = s.account_id "
+                "WHERE s.token_hash = ? AND u.token_hash = a.token_hash", (token_hash,),
+            ).fetchone()
+
+    def delete_sessions(self, now=None, token_hash=None):
+        """Delete sessions expired at now, and the session with token_hash."""
+        with closing(self._connect()) as conn, conn:
+            self._delete_sessions(conn, now, token_hash)
+
+    @staticmethod
+    def _delete_sessions(conn, now, token_hash):
+        # NULL matches nothing, so either condition can be left out.
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ? OR token_hash = ?",
+                     (now, token_hash))
 
     def _select_video(self, conn, video_id):
         row = conn.execute(

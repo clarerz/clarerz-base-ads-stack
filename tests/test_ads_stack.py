@@ -727,7 +727,8 @@ class AdsStackTests(unittest.TestCase):
         path = self.v1_db()
         self.repository.SQLiteAdsRepository(path)
         with closing(sqlite3.connect(path)) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             self.repository.SCHEMA_VERSION)
             plan = conn.execute("EXPLAIN QUERY PLAN SELECT id FROM ads WHERE creator_id = 1 "
                                 "ORDER BY creation_time DESC, id DESC").fetchall()
         self.assertIn("ads_by_creator_time", str(plan))

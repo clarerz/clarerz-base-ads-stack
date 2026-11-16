@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ads</title>
+<link rel="stylesheet" href="/ui/app.css">
+<script src="/ui/app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>Ads</h1>
+  <div id="whoami" hidden>
+    <span id="account-label"></span>
+    <button id="sign-out" type="button">Sign out</button>
+  </div>
+</header>
+<p id="status" role="status" aria-live="polite"></p>
+<main>
+  <section id="signed-out" class="columns" hidden>
+    <form id="sign-in-form">
+      <h2>Sign in</h2>
+      <label for="login">Username or account ID</label>
+      <input id="login" autocomplete="username" required aria-describedby="signin-error">
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required
+             aria-describedby="signin-error">
+      <p id="signin-error" class="error"></p>
+      <button type="submit">Sign in</button>
+    </form>
+    <form id="sign-up-form">
+      <h2>Create a login</h2>
+      <p class="hint">Claim your ad account once with its access token. After that you sign in
+        with your username and password; the token is not stored.</p>
+      <label for="signup-account_id">Account ID</label>
+      <input id="signup-account_id" inputmode="numeric" required
+             aria-describedby="signup-account_id-error">
+      <p id="signup-account_id-error" class="error"></p>
+      <label for="signup-access_token">Access token</label>
+      <input id="signup-access_token" type="password" autocomplete="off" required
+             aria-describedby="signup-access_token-error">
+      <p id="signup-access_token-error" class="error"></p>
+      <label for="signup-username">Username</label>
+      <input id="signup-username" autocomplete="username" required
+             aria-describedby="signup-username-error">
+      <p id="signup-username-error" class="error"></p>
+      <label for="signup-password">Password</label>
+      <input id="signup-password" type="password" autocomplete="new-password" required
+             aria-describedby="signup-password-error">
+      <p id="signup-password-error" class="error"></p>
+      <p id="signup-error" class="error"></p>
+      <button type="submit">Create login</button>
+    </form>
+  </section>
+  <section id="signed-in" hidden>
+    <form id="upload-form">
+      <h2>Upload media</h2>
+      <label for="upload-file">Image or video file</label>
+      <input id="upload-file" type="file" required aria-describedby="upload-file-error"
+             accept=".jpg,.jpeg,.png,.gif,.webp,.mp4,.mov,.m4v,.webm,.mkv,.avi">
+      <p id="upload-file-error" class="error"></p>
+      <label for="upload-name">Name <span class="hint">(required for videos)</span></label>
+      <input id="upload-name" aria-describedby="upload-name-error">
+      <p id="upload-name-error" class="error"></p>
+      <progress id="upload-progress" max="100" value="0" aria-label="Upload progress" hidden>
+      </progress>
+      <p id="upload-error" class="error"></p>
+      <button type="submit">Upload</button>
+    </form>
+    <div class="columns">
+      <fieldset class="media-panel">
+        <legend>Images</legend>
+        <ul id="image-list" class="media-list"></ul>
+        <p id="image-empty" class="hint">No images yet.</p>
+        <button id="image-more" type="button" hidden>Load more images</button>
+      </fieldset>
+      <fieldset class="media-panel">
+        <legend>Videos</legend>
+        <ul id="video-list" class="media-list"></ul>
+        <p id="video-empty" class="hint">No videos yet.</p>
+        <button id="video-more" type="button" hidden>Load more videos</button>
+      </fieldset>
+    </div>
+    <form id="ad-form">
+      <h2>Create ad</h2>
+      <label for="ad-text">Text</label>
+      <textarea id="ad-text" rows="3" required aria-describedby="ad-text-error"></textarea>
+      <p id="ad-text-error" class="error"></p>
+      <p>Media: <span id="ad-media">none; choose an image or video above, or enter a link</span></p>
+      <label for="ad-image">Or an image link</label>
+      <input id="ad-image" type="url" placeholder="https://" aria-describedby="ad-image-error">
+      <p id="ad-image-error" class="error"></p>
+      <p id="ad-error" class="error"></p>
+      <button type="submit">Publish</button>
+    </form>
+    <section aria-labelledby="ads-heading">
+      <h2 id="ads-heading">Your ads (newest first)</h2>
+      <ul id="ad-list" class="ad-list"></ul>
+      <p id="ad-empty" class="hint">No ads yet.</p>
+      <button id="ad-more" type="button" hidden>Load more ads</button>
+    </section>
+  </section>
+</main>
+</body>
+</html>

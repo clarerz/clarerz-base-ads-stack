@@ -60,6 +60,19 @@ class Image:
 
 
 @dataclass(frozen=True)
+class User:
+    """An ad account's web login. token_hash is the access token hash that claimed it; the
+    login is current only while that is still the account's token hash."""
+
+    account_id: int
+    username: str
+    password_hash: str
+    token_hash: str
+    failed_logins: int = 0
+    last_failure: int = 0
+
+
+@dataclass(frozen=True)
 class Video:
     """Only the name can change, through a persisted rename; other fields are fixed at upload."""
 

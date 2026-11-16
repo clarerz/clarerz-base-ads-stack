@@ -1,15 +1,19 @@
 """Object API for accounts, ad publishing/reads, and image and video uploads."""
 
 from dataclasses import replace
+import re
 import secrets
 import time
 
 import image_store
+from models import User
 from publishing import AdPublisher, store_owned_image
 from validation import (AccountValidator, StorageError, UploadValidator, ValidationError,
                         VideoValidator, authenticate, coerce_id, decode_ad_cursor,
-                        encode_ad_cursor, encode_image_cursor, encode_video_cursor,
-                        existing_account_id, hash_token, validate_name, validate_page)
+                        dummy_password_hash, encode_ad_cursor, encode_image_cursor,
+                        encode_video_cursor, existing_account_id, hash_password, hash_token,
+                        validate_name, validate_page, validate_password, validate_username,
+                        verify_password)
 import video_store
 
 
@@ -18,6 +22,13 @@ import video_store
 # older code have no size keys at all and get the placeholder whenever they were uploaded.
 DIMENSIONS_CUTOFF = 1793322000
 PLACEHOLDER_DIMENSIONS = (1080, 1080)
+SESSION_SECONDS = 12 * 3600
+# After this many consecutive failures a login is refused until THROTTLE_SECONDS after the
+# latest one. ponytail: per user, so anyone who knows a (public) account ID can keep its
+# login failing with one bad attempt per window; add per-IP limits before non-demo use.
+MAX_FAILED_LOGINS = 5
+THROTTLE_SECONDS = 30
+_ACCOUNT_ID_LOGIN = re.compile(r"[0-9]+")  # ASCII digits only; str.isdigit accepts others.
 
 
 class AdsService:
@@ -59,6 +70,73 @@ class AdsService:
         if account_id is None or not self.repository.set_token_hash(account_id, hash_token(token)):
             raise ValidationError("002", "account_id")
         return token
+
+    def create_user(self, account_id, access_token, username, password):
+        """Give the account its web login, proved by its current access token; return the User.
+
+        The token is checked here and never stored or usable as the password. A login claimed
+        with a token that has since been reissued is replaced.
+        """
+        account_id = existing_account_id(self.repository, account_id, "account_id")
+        # Authenticate first, so only the account's owner learns whether a username is taken.
+        authenticate(self.repository, account_id, access_token, sessions=False)
+        user = User(account_id, validate_username(username),
+                    hash_password(validate_password(password, access_token)),
+                    hash_token(access_token))
+        blocked = self.repository.create_user(user)
+        if blocked is not None:
+            raise ValidationError("002", blocked)
+        return user
+
+    def login(self, login, password, replaces=None):
+        """Start a session for a username or account ID; return (token, user, account).
+
+        Every failure raises the same 002 for login. replaces is the caller's previous
+        session token, if any; it is ended.
+        """
+        now = int(self.clock())
+        user = self._login_user(login)
+        current = (user is not None
+                   and self.repository.get_token_hash(user.account_id) == user.token_hash)
+        # Exactly one scrypt run on every path, before anything else is decided, so response
+        # time does not reveal whether the login exists, is stale, or is throttled.
+        matches = verify_password(password if isinstance(password, str) else "",
+                                  user.password_hash if current else dummy_password_hash())
+        throttled = (current and user.failed_logins >= MAX_FAILED_LOGINS
+                     and now - user.last_failure < THROTTLE_SECONDS)
+        if current:
+            self.repository.record_login(user.account_id, matches and not throttled, now)
+        if not (current and matches and not throttled):
+            raise ValidationError("002", "login")
+        token = secrets.token_urlsafe(32)
+        self.repository.create_session(
+            hash_token(token), user.account_id, now + SESSION_SECONDS, now,
+            replaces=hash_token(replaces) if isinstance(replaces, str) else None)
+        return token, user, self.repository.get_account(user.account_id)
+
+    def _login_user(self, login):
+        if not isinstance(login, str):
+            return None
+        login = login.strip()
+        if _ACCOUNT_ID_LOGIN.fullmatch(login):
+            account_id = coerce_id(login)  # None past SQLite's range.
+            return None if account_id is None else self.repository.get_user(account_id=account_id)
+        return self.repository.get_user(username=login)
+
+    def get_session(self, session_token):
+        """Return (user, account) for a live session of a current login, else None."""
+        now = int(self.clock())
+        self.repository.delete_sessions(now=now)
+        session = (self.repository.get_session(hash_token(session_token))
+                   if isinstance(session_token, str) else None)
+        if session is None or session[1] <= now:
+            return None
+        return (self.repository.get_user(account_id=session[0]),
+                self.repository.get_account(session[0]))
+
+    def logout(self, session_token):
+        if isinstance(session_token, str):
+            self.repository.delete_sessions(token_hash=hash_token(session_token))
 
     def get_account(self, account_id):
         account_id = coerce_id(account_id)

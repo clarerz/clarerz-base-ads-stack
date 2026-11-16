@@ -61,7 +61,13 @@ missing video.
 
 Accounts created before authentication have no token and cannot write until an
 operator issues one with `AdsService(repository).issue_access_token(account_id)`.
-That call also replaces a lost or leaked token; the old one stops working.
+That call also replaces a lost or leaked token; the old one stops working, and so
+do the account's web login and its sessions (see [Web UI](#web-ui)).
+
+An account can also have one web login (username and password) for the web UI.
+`AdsService.create_user(account_id, access_token, username, password)` creates it;
+`login(login, password)` returns a session token that `authenticate` accepts for that
+account wherever an access token is accepted, until it expires or `logout` ends it.
 
 ## HTTP API
 
@@ -98,6 +104,11 @@ use the same `{"error_code", "error_message"}` body.
 | `GET` | `/accounts/{account_id}/media/{images\|videos}/{hash}?exp&sig` | Account token or signed URL | 200 file bytes |
 | `GET` | `/accounts/{account_id}/ads/{ad_id}/previews?ad_format=` | Account token | 200 `{"data": [{"format", "preview_url", "width", "height", "warnings"}]}` |
 | `GET` | `/accounts/{account_id}/ads/{ad_id}/previews/{feed\|story\|banner}?exp&sig` | Account token or signed URL | 200 HTML page |
+| `POST` | `/accounts/{account_id}/users` (`{"username", "password"}`) | Account token, `X-Ads-UI: 1` | 201 `{"username", "account_id"}` |
+| `POST` | `/session` (`{"login", "password"}`) | `X-Ads-UI: 1` | 200 `{"username", "account_id", "account_name"}`, sets `ads_session` |
+| `GET` | `/session` | Session cookie | 200 same body |
+| `DELETE` | `/session` | `X-Ads-UI: 1` | 204, clears `ads_session` |
+| `GET` | `/ui`, `/ui/app.js`, `/ui/app.css` | None | 200 web UI files |
 
 Status codes: `001` and `002` errors return 400, except `002` for
 `access_token` (a missing or wrong token or admin key), which returns 401. A
@@ -222,6 +233,52 @@ spools it under `uploads/` in the data directory, and deletes the spooled copy
 afterwards. A missing `Content-Length` (for example a chunked upload) returns
 411 and a body over the size limit returns 413, both with `002` for `file`.
 
+## Web UI
+
+`GET /ui` serves a browser page for internal demos: sign in, upload images and
+videos, create ads, and see the account's ads. Start the HTTP API as above and open
+`http://127.0.0.1:8000/ui`. It uses the same routes as other clients; there is no
+build step.
+
+**Logins.** Each ad account has at most one web login. Create it once from the page
+("Create a login") with the account ID, the account's access token, a username, and a
+password; the token proves ownership for that one request and is not stored. Sign in
+with the username (any case) or the numeric account ID. Usernames are 3–32 ASCII
+letters, digits, `_`, `.`, or `-` with at least one letter (so they are never all
+digits); passwords are 8–128 characters and may not equal the access token. Passwords
+are stored as salted scrypt hashes. Errors: `002` for `username` (invalid or taken),
+`password`, or `account_id` (the account already has a login) return 400; a missing or
+wrong token returns 401 `002` for `access_token`. A session cookie never authorizes
+sign-up.
+
+**Sessions.** A successful `POST /session` sets the `ads_session` cookie (`HttpOnly`,
+`SameSite=Strict`, `Path=/`, 12 hours). It is `Secure` unless the server runs with
+`ADS_INSECURE_COOKIES=1`; browsers accept `Secure` cookies from `http://localhost` and
+`http://127.0.0.1`, so set it only to serve plain HTTP on another host. Every failed
+login (unknown login, wrong password, throttled, or a login whose token was reissued)
+returns the same 401 `002` for `login`, and every attempt runs exactly one scrypt check
+so timing does not tell them apart. After 5 consecutive failures a login is refused
+until 30 seconds after the latest one. Issuing the account a new access token ends its
+login and sessions; the new token can then create a login again.
+
+**Cookie authentication.** The account routes accept the session cookie in place of
+the bearer token only when the request has `X-Ads-UI: 1` and no `Authorization`
+header. Cross-origin pages cannot send that header (the server answers no CORS
+preflight), so other sites cannot use the cookie. `POST /accounts` and sign-up read the
+`Authorization` header only. Responses to cookie-authenticated requests carry
+`preview_url: null`; the page shows no previews.
+
+**The page.** Images and videos are listed separately (25 per page) and either can be
+selected as an ad's media, or an image link entered instead. The account's ads are
+listed newest first, 10 per page. Upload progress, duplicate uploads (409), and API
+errors are shown next to the relevant field; a 401 returns to sign-in. Pages are served
+with a CSP that allows only this server's script, style, and connections, and server
+values are inserted as text only.
+
+Known limits: the throttle is per login, so anyone who knows an account ID (they are
+public) can keep its login failing with one bad attempt every 30 seconds; add per-IP
+limits before using this beyond demos. At most 4 scrypt checks run at once per process.
+
 ## Objects and fields
 
 An ad contains `id`, `system_name` (`ad_<id>`), `image_hash`, `text`,
@@ -328,7 +385,8 @@ and metadata. The existing functions in `publish.py` still return dictionaries.
 | `video_store.py` | Local video storage on top of `file_store`. |
 | `publish.py` | Compatibility API that translates objects and errors into dictionaries. |
 | `previews.py` | Ad preview formats, their warnings, and escaped static HTML pages. |
-| `api.py` | FastAPI HTTP API over `AdsService`; maps errors to HTTP status codes. |
+| `api.py` | FastAPI HTTP API over `AdsService`; maps errors to HTTP status codes; session cookie and web UI routes. |
+| `web/` | The web UI: `index.html`, `app.js`, `app.css`. |
 
 Use the object API to work directly with accounts and ads:
 
@@ -357,8 +415,9 @@ ingestion, fails; an unreadable upload source is invalid input (`002` for
 every failure into an error dictionary. The schema is versioned with SQLite's
 `user_version`: creating a repository on an older database migrates it once,
 under a write lock, and an up-to-date database is opened without one. Older
-databases gain the `videos` and `image_owners` tables, the `ads.video_id` and
-`accounts.token_hash` columns, and an index for listing a creator's ads;
+databases gain the `videos`, `image_owners`, `users`, and `sessions` tables, the
+`ads.video_id` and `accounts.token_hash` columns, and an index for listing a creator's
+ads;
 existing ads read back with `video_id: None`, and existing accounts have no
 token.
 
@@ -404,7 +463,8 @@ storage. A different repository must implement the `AdsRepository` protocol in
 
 By default, generated data lives beside the modules under `data/`:
 
-- `ads.db`: SQLite accounts, ads, videos, and image ownership.
+- `ads.db`: SQLite accounts, ads, videos, image ownership, web logins, and sessions
+  (session tokens are stored only as SHA-256 hashes).
 - `image_store_data/`: copied local files, named by the first 32 hex characters
   of their SHA-256 with no extension, and `persisted_images.json`. Registered
   paths are absolute: a copied data directory keeps its local copy on re-upload,
@@ -458,12 +518,20 @@ Run the local business behavior tests with Python's standard library:
 python3 -m unittest discover -s tests -v
 ```
 
-The HTTP API tests need the packages in `requirements.txt` and are skipped
-without them. Run every suite from the virtual environment:
+The HTTP API tests need the packages in `requirements.txt`, and the browser tests
+also need Playwright and Chromium from `requirements-dev.txt`; each is skipped without
+its packages. Run every suite from the virtual environment:
 
 ```bash
+uv pip install --python .venv/bin/python -r requirements-dev.txt
+.venv/bin/playwright install chromium
 .venv/bin/python -m unittest discover -s tests -v
 ```
+
+`tests/test_logins.py` covers web logins and sessions in the repository, service, and
+`authenticate`; `tests/test_api_logins.py` covers their HTTP routes, the session cookie on
+account routes, and the UI files; `tests/test_ui_browser.py` drives the page in headless
+Chromium against a real server.
 
 `tests/test_api.py` drives the app in process with FastAPI's `TestClient`;
 `tests/test_api_e2e.py` starts a real uvicorn server on a free port and calls
@@ -480,7 +548,8 @@ They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The standard-library suite has 111 tests (161 with the HTTP API suites), including boundary cases, storage failures, rollback,
+The standard-library suite has 135 tests (203 with the HTTP API suites, 222 with the
+browser tests), including boundary cases, storage failures, rollback,
 schema migrations, concurrent SQLite ad ID allocation and registry writes, token
 and ownership enforcement, size limits, and ad, video, and image listings. See
 [VERIFICATION.md](VERIFICATION.md) for the test audit, deliberate regression

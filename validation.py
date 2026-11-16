@@ -1,9 +1,13 @@
 """Validation rules without image ingestion or ad/account writes."""
 
+from functools import cache
 import hashlib
 import hmac
 from pathlib import Path
 import re
+import secrets
+import threading
+import time
 
 import image_store
 from models import AdAccount, AdDraft
@@ -17,6 +21,14 @@ VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"})
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 100
 _MAX_SQLITE_INT = 2**63 - 1
+# ASCII only, with a letter, so a username is never mistaken for an account ID at login.
+USERNAME_REGEX = re.compile(r"(?=[^A-Za-z]*[A-Za-z])[A-Za-z0-9_.-]{3,32}")
+MIN_PASSWORD_LENGTH = 8
+MAX_PASSWORD_LENGTH = 128
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1  # About 50 ms and 16 MiB per hash.
+# ponytail: per-process cap so logins cannot occupy every worker thread; a shared limit
+# across processes would need an external store.
+_SCRYPT_SLOTS = threading.BoundedSemaphore(4)
 
 
 class ValidationError(ValueError):
@@ -59,16 +71,71 @@ def hash_token(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def authenticate(repository, account_id, token, field="access_token"):
-    """Raise ValidationError unless token is the account's current access token."""
+def _scrypt(password, salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
+    with _SCRYPT_SLOTS:
+        # surrogatepass: a JSON body can carry lone surrogates, which plain UTF-8 rejects.
+        return hashlib.scrypt(password.encode("utf-8", "surrogatepass"), salt=salt, n=n, r=r,
+                              p=p, dklen=32)
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    return (f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${salt.hex()}$"
+            f"{_scrypt(password, salt).hex()}")
+
+
+def verify_password(password, stored):
+    """Return whether password matches the stored hash; runs exactly one scrypt."""
+    _, n, r, p, salt, expected = stored.split("$")
+    actual = _scrypt(password, bytes.fromhex(salt), int(n), int(r), int(p))
+    return hmac.compare_digest(actual, bytes.fromhex(expected))
+
+
+@cache
+def dummy_password_hash():
+    """A hash no password matches, verified for logins with no user so timing is uniform."""
+    return hash_password(secrets.token_urlsafe(32))
+
+
+def validate_username(value):
+    if not isinstance(value, str) or not USERNAME_REGEX.fullmatch(value):
+        raise ValidationError("002", "username")
+    return value
+
+
+def validate_password(value, access_token):
+    # The access token proves ownership once at sign-up; it must never become the password.
+    if (not isinstance(value, str)
+            or not MIN_PASSWORD_LENGTH <= len(value) <= MAX_PASSWORD_LENGTH
+            or value == access_token):
+        raise ValidationError("002", "password")
+    return value
+
+
+def authenticate(repository, account_id, token, field="access_token", sessions=True):
+    """Raise ValidationError unless token is the account's current access token or, if
+    sessions is true, the token of a live session of the account's current web login."""
     try:
         stored = repository.get_token_hash(account_id)
     except Exception as exc:
         raise StorageError(field) from exc
-    # Accounts created before authentication have no token until one is issued.
-    if (not isinstance(stored, str) or not isinstance(token, str) or not token.isascii()
-            or not hmac.compare_digest(stored, hash_token(token))):
+    # Accounts created before authentication have no token until one is issued, and so no
+    # web login either.
+    if not isinstance(stored, str) or not isinstance(token, str) or not token.isascii():
         raise ValidationError("002", field)
+    if hmac.compare_digest(stored, hash_token(token)):
+        return
+    if not (sessions and _live_session(repository, account_id, token, field)):
+        raise ValidationError("002", field)
+
+
+def _live_session(repository, account_id, token, field):
+    try:
+        session = repository.get_session(hash_token(token))
+    except Exception as exc:
+        raise StorageError(field) from exc
+    # Validators have no clock, so sessions expire by wall-clock time here.
+    return session is not None and session[0] == account_id and session[1] > time.time()
 
 
 class AccountValidator:

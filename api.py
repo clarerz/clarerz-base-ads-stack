@@ -10,7 +10,7 @@ import tempfile
 from fastapi import APIRouter, Body, Depends, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBearer
 from starlette.exceptions import HTTPException
 
@@ -21,7 +21,7 @@ from models import Image
 import previews
 import publish
 from repository import SQLiteAdsRepository
-from service import AdsService
+from service import SESSION_SECONDS, AdsService
 from validation import (HASH_REGEX, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, AdValidator,
                         ProjectionValidator, StorageError, ValidationError, authenticate,
                         coerce_id, existing_account_id, hash_token, validate_name)
@@ -38,6 +38,10 @@ router = APIRouter()
 # The field named in errors the framework raises before a route runs.
 HTTP_ERROR_FIELDS = {400: "body", 405: "method"}
 _bearer = HTTPBearer(auto_error=False)
+SESSION_COOKIE = "ads_session"
+# The web UI sends this header on every call. Cross-origin pages cannot send it without a CORS
+# preflight, which this server never approves, so it marks a request as same-origin.
+UI_HEADER = "X-Ads-UI"
 
 
 def with_status(exc, status):
@@ -70,14 +74,16 @@ def status_for(exc):
     return 400
 
 
-def call(resource, fn, *args, not_found=()):
+def call(resource, fn, *args, not_found=(), unauthorized=()):
     """Run a service call; unexpected failures become 003 for resource, like publish.py."""
     try:
         return fn(*args)
     except ValidationError as exc:
-        # Some routes report a field's invalid value as a missing resource.
+        # Some routes report a field's invalid value as a missing resource or failed login.
         if exc.code == "002" and exc.field in not_found:
             raise with_status(exc, 404)
+        if exc.code == "002" and exc.field in unauthorized:
+            raise with_status(exc, 401)
         raise
     except Exception as exc:
         raise StorageError(resource) from exc
@@ -102,12 +108,22 @@ def get_service(request: Request):
     return request.app.state.service
 
 
-def bearer_token(credentials=Depends(_bearer)):
+def header_token(credentials=Depends(_bearer)):
     # None for a missing header, another scheme, or an empty token; the checks reject None.
     return credentials.credentials if credentials is not None else None
 
 
-def require_admin(request: Request, token=Depends(bearer_token)):
+def bearer_token(request: Request, token=Depends(header_token)):
+    """The Authorization bearer token or, for a UI request with no Authorization header, the
+    session cookie, which authenticate accepts for the session's own account."""
+    if "authorization" in request.headers or request.headers.get(UI_HEADER) != "1":
+        return token
+    session = request.cookies.get(SESSION_COOKIE)
+    request.state.session_auth = session is not None
+    return session
+
+
+def require_admin(request: Request, token=Depends(header_token)):
     # A dependency, so it runs before the body is validated. No configured key: no creates.
     key = request.app.state.admin_key
     if not (key and token and hmac.compare_digest(key.encode(), token.encode())):
@@ -132,6 +148,61 @@ def rename_account(account_id: str, body: dict = Body(...), token=Depends(bearer
     data = check_fields(body, {"name"})
     return call("account", service.rename_account, account_id, data.get("name"),
                 token).to_dict()
+
+
+def require_ui(request, field):
+    if request.headers.get(UI_HEADER) != "1":
+        raise with_status(ValidationError("002", field), 401)
+
+
+def session_json(user, account):
+    return {"username": user.username, "account_id": account.id, "account_name": account.name}
+
+
+@router.post("/accounts/{account_id}/users", status_code=201)
+def create_user(account_id: str, request: Request, body: dict = Body(...),
+                token=Depends(header_token), service=Depends(get_service)):
+    """Give the account its web login; the access token proves ownership once, so the
+    session cookie never counts here."""
+    require_ui(request, "access_token")
+    data = check_fields(body, {"username", "password"})
+    user = call("account", service.create_user, account_id, token, data.get("username"),
+                data.get("password"))
+    return {"username": user.username, "account_id": user.account_id}
+
+
+@router.post("/session")
+def login(request: Request, response: Response, body: dict = Body(...),
+          service=Depends(get_service)):
+    require_ui(request, "login")
+    data = check_fields(body, {"login", "password"})
+    # A login replaces the browser's previous session, so a planted cookie never lives on.
+    token, user, account = call("login", service.login, data.get("login"), data.get("password"),
+                                request.cookies.get(SESSION_COOKIE), unauthorized=("login",))
+    response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_SECONDS, path="/",
+                        secure=request.app.state.secure_cookies, httponly=True,
+                        samesite="strict")
+    response.headers["Cache-Control"] = "no-store"
+    return session_json(user, account)
+
+
+@router.get("/session")
+def get_session(request: Request, response: Response, service=Depends(get_service)):
+    session = call("login", service.get_session, request.cookies.get(SESSION_COOKIE))
+    if session is None:
+        raise with_status(ValidationError("002", "login"), 401)
+    response.headers["Cache-Control"] = "no-store"
+    return session_json(*session)
+
+
+@router.delete("/session", status_code=204)
+def logout(request: Request, service=Depends(get_service)):
+    require_ui(request, "login")
+    call("login", service.logout, request.cookies.get(SESSION_COOKIE))
+    response = Response(status_code=204, headers={"Cache-Control": "no-store"})
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=request.app.state.secure_cookies,
+                           httponly=True, samesite="strict")
+    return response
 
 
 def page_params(limit: str | None = None, cursor: str | None = None, since: str | None = None,
@@ -313,11 +384,12 @@ def signed_url(request, token_hash, owner_id, scope, subject, route, expires=Non
     """Return a URL for route signed for owner_id's scope and subject, valid until expires
     (default: PREVIEW_SECONDS from now).
 
-    None without a key. Only callers that have authenticated owner_id (by token or signed URL)
+    None without a key, and for requests authenticated by session cookie, whose token hash is
+    not the account's. Only callers that have authenticated owner_id (by token or signed URL)
     call this; token_hash is the account's current one.
     """
     key = request.app.state.media_key
-    if not key:
+    if not key or getattr(request.state, "session_auth", False):
         return None
     if expires is None:
         expires = int(request.app.state.service.clock()) + PREVIEW_SECONDS
@@ -516,6 +588,32 @@ def get_ad_preview(account_id: str, ad_id: str, ad_format: str, request: Request
     })
 
 
+WEB_DIR = Path(__file__).resolve().parent / "web"
+UI_ASSETS = {"app.js": "text/javascript", "app.css": "text/css"}
+UI_HEADERS = {
+    # Scripts and styles come only from the files below; API calls only to this server.
+    "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; "
+                               "connect-src 'self'; img-src 'self'; form-action 'self'; "
+                               "frame-ancestors 'none'; base-uri 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+
+
+# Explicit routes rather than a StaticFiles mount, which would redirect /ui to /ui/.
+@router.get("/ui", include_in_schema=False)
+def ui_page():
+    return FileResponse(WEB_DIR / "index.html", media_type="text/html", headers=UI_HEADERS)
+
+
+@router.get("/ui/{asset}", include_in_schema=False)
+def ui_asset(asset: str):
+    if asset not in UI_ASSETS:
+        raise with_status(ValidationError("002", "path"), 404)
+    return FileResponse(WEB_DIR / asset, media_type=UI_ASSETS[asset], headers=UI_HEADERS)
+
+
 class JsonBodyLimit:
     """Refuse oversized or unsized JSON bodies before FastAPI reads them into memory.
 
@@ -545,13 +643,18 @@ class JsonBodyLimit:
         await self.app(scope, receive, send)
 
 
-def create_app(service=None, admin_key=None, spool_dir=None, media_key=None):
+def create_app(service=None, admin_key=None, spool_dir=None, media_key=None,
+               secure_cookies=None):
     app = FastAPI(title="Ads publishing API")
     app.state.service = (service if service is not None
                          else AdsService(SQLiteAdsRepository(publish.DB_PATH)))
     app.state.admin_key = admin_key if admin_key is not None else os.environ.get("ADS_ADMIN_KEY")
     # No key: previews carry no URL and every media request is a 404.
     app.state.media_key = media_key if media_key is not None else os.environ.get("ADS_MEDIA_KEY")
+    # Session cookies are Secure unless plain-HTTP development opts out explicitly; browsers
+    # accept Secure cookies from http://localhost.
+    app.state.secure_cookies = (secure_cookies if secure_cookies is not None
+                                else os.environ.get("ADS_INSECURE_COOKIES") != "1")
     app.state.spool_dir = Path(spool_dir) if spool_dir is not None else config.DATA_DIR / "uploads"
     app.add_exception_handler(
         ValidationError, lambda request, exc: JSONResponse(exc.to_dict(), status_for(exc)))

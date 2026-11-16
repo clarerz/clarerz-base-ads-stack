@@ -18,7 +18,7 @@
 
 ## Coverage
 
-111 standard-library test methods (161 with the HTTP API suites), with parameterized subtests, cover:
+135 standard-library test methods (203 with the HTTP API suites, 222 with the browser tests), with parameterized subtests, cover:
 
 | Area | Checks |
 | --- | --- |
@@ -33,6 +33,9 @@
 | Reads | Full objects, projections of every supported shape including comma-separated strings, invalid projections, missing records, `get_video`. |
 | Image registry | Seeded records, unreadable seed file fails loudly, metadata-only URL ingestion, damaged registry left untouched, interrupted writes keep the previous registry, concurrent URL and file ingestions from several processes all kept. |
 | Extensibility | Extra validation rules, custom publish stage, injected image storage and clock (shared by the service and its default publisher), custom upload and video validators, validator using the publisher's storage. |
+| Web logins | One login per account; ASCII username and password rules with boundaries; case-insensitive usernames; salted scrypt storage; sign-up only by the current access token (never a session); login by username or account ID (not non-ASCII digits); identical failures with exactly one scrypt run each; 30-second throttle after 5 failures; 12-hour expiry; logout; token rotation ends the login and allows a re-claim. |
+| Session cookie | Every account route works with the cookie plus `X-Ads-UI` for its own account only (`/videos/{id}` of others stays 404); ignored without the header or with any `Authorization` header; never the admin key; `Secure`/`HttpOnly`/`SameSite=Strict` attributes and the opt-out; `no-store`; session responses carry no signed URLs. |
+| Web UI | Served files and their CSP and headers, no inline code or HTML insertion; in Chromium: sign-up, sign-in by account ID and keyboard, sign-out, reload, field errors, uploads with selection, duplicates, video name check, paging of media and ads, ad creation with each media source, one source at a time, rows with names and cut text, text-only rendering, and expired sessions returning to sign-in. |
 | Persistence | Fresh-process reads, versioned migration of legacy and v1 schemas (once, concurrently, without locking current databases), repair of early `image_owners` shapes, the ads-by-creator index, failed-insert rollback, concurrent ad ID allocation, `003` error dictionaries for storage failures. |
 
 ## Regression detection
@@ -73,7 +76,7 @@ mutation score or a proof of correctness.
 
 ## Result and limits
 
-All 111 standard-library tests pass using:
+All 135 standard-library tests pass using:
 
 ```bash
 python3 -m unittest discover -s tests -v
