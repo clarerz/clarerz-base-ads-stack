@@ -99,6 +99,19 @@
       <p id="ad-empty" class="hint">No ads yet.</p>
       <button id="ad-more" type="button" hidden>Load more ads</button>
     </section>
+    <dialog id="preview-dialog" aria-labelledby="preview-heading">
+      <h2 id="preview-heading"></h2>
+      <p id="preview-message" class="hint"></p>
+      <div id="preview-frames"></div>
+      <div id="preview-share" hidden>
+        <label for="share-link">Share link</label>
+        <input id="share-link" readonly>
+        <button id="copy-share" type="button">Copy link</button>
+        <span id="share-expires" class="hint"></span>
+        <p id="share-status" role="status" aria-live="polite"></p>
+      </div>
+      <button id="preview-close" type="button">Close</button>
+    </dialog>
   </section>
 </main>
 </body>

@@ -30,6 +30,13 @@ legend { font-weight: 600; padding: 0 4px; }
 progress { width: 100%; margin-top: 10px; }
 #signed-in > form, #signed-in > .columns { margin-bottom: 16px; }
 .ad-list { list-style: none; margin: 0; padding: 0; }
-.ad-list li { display: grid; grid-template-columns: 4em 11em 12em 1fr; gap: 8px;
+.ad-list li { display: grid; grid-template-columns: 4em 11em 12em 1fr auto; gap: 8px;
   padding: 6px 0; border-top: 1px solid #ebedf0; }
 .ad-list li:first-child { border-top: 0; }
+.ad-list button { margin-top: 0; }
+#preview-dialog { width: min(1500px, 95vw); }
+#preview-frames { display: flex; flex-wrap: wrap; gap: 16px; }
+#preview-frames figure { margin: 0; }
+#preview-frames figcaption { font-weight: 600; }
+#preview-frames iframe { max-width: 100%; border: 1px solid #dddfe2; background: #fff; }
+.warning { margin: 4px 0 0; color: #8a5a00; }

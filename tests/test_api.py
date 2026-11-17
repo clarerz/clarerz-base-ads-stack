@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import html
 import json
 import os
 import re
@@ -9,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import struct
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -825,6 +827,187 @@ class ApiTests(unittest.TestCase):
                           side_effect=sqlite3.OperationalError("disk I/O error")):
             self.assert_error(self.previews(), 503, "003", "ad")
             self.assert_error(self.client.get(url), 503, "003", "preview")
+
+    SHARE_HEADERS = {
+        "content-security-policy": "sandbox; default-src 'none'; frame-src http://testserver; "
+                                   "style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
+        "cache-control": "no-store",
+    }
+
+    def share_url(self, ad_id=1):
+        response = self.previews(ad_id)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["share_url"]
+
+    def share(self, url, headers=None):
+        """GET a share page; every response, found or not, carries the share page headers."""
+        response = self.client.get(url, headers=headers)
+        self.assertEqual(response.headers["content-type"], "text/html; charset=utf-8")
+        for name, value in self.SHARE_HEADERS.items():
+            self.assertEqual(response.headers[name], value, name)
+        return response
+
+    @staticmethod
+    def frames(page):
+        return [(html.unescape(src), int(width), int(height)) for src, width, height in re.findall(
+            r'<iframe src="([^"]*)" width="(\d+)" height="(\d+)"', page)]
+
+    def test_previews_listing_returns_a_share_link(self):
+        self.assertEqual(self.publish_ad().status_code, 201)
+        expires = self.now + 604800
+        for params in ({}, {"ad_format": "banner"}):
+            with self.subTest(params=params):
+                body = self.previews(**params).json()
+                self.assertEqual(body["share_expires"], expires)
+                self.assertTrue(body["share_url"].startswith(
+                    f"http://testserver/accounts/1/ads/1/share?exp={expires}&sig="))
+        self.client = self.make_client(None)
+        body = self.previews().json()
+        self.assertEqual((body["share_url"], body["share_expires"]), (None, None))
+
+    def test_share_page_shows_every_placement(self):
+        self.assertEqual(self.publish_ad(text=("Fresh picks " * 11)[:130].rstrip()).status_code, 201)
+        self.assertEqual(self.publish_ad(text=("Fresh picks " * 5)[:60].rstrip()).status_code, 201)
+        expires = self.now + 604800
+        response = self.share(self.share_url())
+        self.assertEqual(response.status_code, 200, response.text)
+        page = response.text
+        frames = self.frames(page)
+        self.assertEqual([(width, height) for _, width, height in frames],
+                         [(500, 640), (360, 640), (600, 354)])
+        for (src, _, _), name in zip(frames, ("feed", "story", "banner")):
+            self.assertIn(f"/previews/{name}?exp={expires}", src)
+            self.preview_page(src)
+        self.assertEqual(page.count("Text is cut off"), 3)
+        self.assertIn('<meta name="viewport" content="width=device-width, initial-scale=1">', page)
+        self.assertIn("iframe{display:block;max-width:100%", page)
+        self.assertIn("Advertiser One", page)
+        self.assertIn("Ad #1", page)
+        self.assertIn("Link expires " + time.strftime("%Y-%m-%d %H:%M", time.gmtime(expires))
+                      + " UTC", page)
+        self.assertEqual(self.share(self.share_url(2)).text.count("Text is cut off"), 1)
+
+    def test_nothing_outlives_the_share_link(self):
+        image_hash = self.upload_image(PNG).json()["hash"]
+        self.assertEqual(self.publish_ad(image_hash=image_hash).status_code, 201)
+        self.assertEqual(self.upload_video(MP4).status_code, 201)
+        self.assertEqual(self.publish_ad(video_id=1).status_code, 201)
+        expires = self.now + 604800
+
+        def collect():
+            urls = [self.share_url(ad_id) for ad_id in (1, 2)]
+            frames = [src for url in urls for src, _, _ in self.frames(self.share(url).text)]
+            media = [src for frame in frames for src in self.media_sources(self.preview_page(frame))]
+            return urls, frames, media
+
+        urls, frames, media = collect()
+        self.assertEqual(len(media), 6)
+        for url in frames + media:
+            self.assertIn(f"exp={expires}", url)
+        for url in media:
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["cache-control"], "private, max-age=600, immutable")
+        start = self.now
+        self.now = start + 604800
+        for url in urls:
+            self.assertEqual(self.share(url).status_code, 404)
+        for url in frames + media:
+            self.assertEqual(self.client.get(url).status_code, 404)
+        self.now = start
+        urls, frames, media = collect()
+        self.client.app.state.service.issue_access_token(1)
+        for url in urls:
+            self.assertEqual(self.share(url).status_code, 404)
+        for url in frames + media:
+            self.assertEqual(self.client.get(url).status_code, 404)
+
+    def test_share_links_reveal_nothing(self):
+        other_token = self.create_account(2, "Advertiser Two")
+        self.assertEqual(self.publish_ad().status_code, 201)
+        self.assertEqual(self.publish_ad().status_code, 201)
+        theirs = self.client.post("/accounts/2/ads", headers=self.bearer(other_token),
+                                  json={"text": VALID_TEXT, "image": self.seeded[0]["url"]})
+        self.assertEqual(theirs.json(), {"id": 3})
+        url = self.share_url()
+        path, _, query = url.removeprefix("http://testserver").partition("?")
+        params = dict(pair.split("=") for pair in query.split("&"))
+        exp, sig = params["exp"], params["sig"]
+        token_hash = self.validation.hash_token(self.token)
+        sign = lambda scope, subject, expires=exp: self.api.media_signature(
+            MEDIA_KEY, 1, scope, subject, expires, token_hash)
+        bad = [
+            f"{path}?exp={exp}&sig={sig[:-1]}{'0' if sig[-1] != '0' else '1'}",
+            f"{path}?exp={int(exp) + 1}&sig={sig}",
+            f"{path}?exp=abc&sig={sig}",
+            f"{path}?exp=-1&sig={sig}",
+            f"{path}?exp=99999999999999999999&sig={sig}",
+            path,
+            f"/accounts/1/ads/2/share?{query}",
+            f"/accounts/2/ads/1/share?{query}",
+            f"{path}?exp={exp}&sig={sign('preview:feed', '1')}",
+            f"{path}?exp={exp}&sig={sign('images', '1')}",
+            f"/accounts/1/ads/99/share?exp={exp}&sig={sign('share', '99')}",
+            # Account 2's ad under account 1, signed for account 1.
+            f"/accounts/1/ads/3/share?exp={exp}&sig={sign('share', '3')}",
+            # Signed with a different media key.
+            f"{path}?exp={exp}&sig={self.api.media_signature('other-key', 1, 'share', '1', exp, token_hash)}",
+        ]
+        for candidate in bad:
+            with self.subTest(url=candidate):
+                response = self.share(candidate)
+                self.assertEqual((response.status_code, response.text),
+                                 (404, self.api.previews.SHARE_NOT_FOUND))
+        self.assertEqual(self.share(url).status_code, 200)
+        self.now += 604800
+        response = self.share(url)
+        self.assertEqual((response.status_code, response.text),
+                         (404, self.api.previews.SHARE_NOT_FOUND))
+        self.now -= 604800
+        # A share signature opens neither a preview page nor media.
+        self.assert_error(self.client.get(f"/accounts/1/ads/1/previews/feed?{query}"),
+                          404, "002", "preview")
+        image_hash = self.upload_image(PNG).json()["hash"]
+        self.assert_error(self.client.get(f"/accounts/1/media/images/{image_hash}?{query}"),
+                          404, "002", "media")
+        self.assertEqual(self.share(url).status_code, 200)
+        self.token = self.client.app.state.service.issue_access_token(1)
+        response = self.share(url)
+        self.assertEqual((response.status_code, response.text),
+                         (404, self.api.previews.SHARE_NOT_FOUND))
+        # The account's own token opens the page, with 10-minute frame URLs.
+        response = self.share(path, self.bearer(self.token))
+        self.assertEqual(response.status_code, 200, response.text)
+        frames = self.frames(response.text)
+        self.assertEqual(len(frames), 3)
+        for src, _, _ in frames:
+            self.assertIn(f"exp={self.now + 600}", src)
+        # A server without a media key reveals nothing, with or without a token.
+        self.client = self.make_client(None)
+        for headers in (None, self.bearer(self.token)):
+            with self.subTest(keyless=headers):
+                response = self.share(url, headers)
+                self.assertEqual((response.status_code, response.text),
+                                 (404, self.api.previews.SHARE_NOT_FOUND))
+
+    def test_share_page_is_static_and_escaped(self):
+        rename = self.client.patch("/accounts/1", json={"name": "<script>x</script>"},
+                                   headers=self.bearer(self.token))
+        self.assertEqual(rename.status_code, 200, rename.text)
+        self.assertEqual(self.publish_ad().status_code, 201)
+        page = self.share(self.share_url()).text
+        self.assertIn("&lt;script&gt;x&lt;/script&gt;", page)
+        self.assertNotIn("<script", page)
+
+    def test_share_storage_failure_is_503(self):
+        self.assertEqual(self.publish_ad().status_code, 201)
+        url = self.share_url()
+        service = self.client.app.state.service
+        with patch.object(service.repository, "get_ad",
+                          side_effect=sqlite3.OperationalError("disk I/O error")):
+            self.assert_error(self.client.get(url), 503, "003", "share")
 
 
 if __name__ == "__main__":

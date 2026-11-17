@@ -1,6 +1,7 @@
 """Ad preview formats rendered as static HTML pages; no storage or HTTP here."""
 
 from html import escape
+import time
 
 # Page and media sizes in CSS pixels. Each media frame has its format's aspect ratio:
 # feed 1:1, story 9:16, banner 1.91:1 (1200x628). Text is cut at text_limit characters.
@@ -22,6 +23,14 @@ def warnings(ad_format, text, width=None, height=None):
         if abs(width / height - frame) > CROP_TOLERANCE * frame:
             found.append("media_cropped")
     return found
+
+# What each warning from warnings() means, for the share page and the UI.
+WARNING_TEXT = {"text_truncated": "Text is cut off", "media_cropped": "Image is cropped to fit"}
+
+SHARE_NOT_FOUND = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Preview unavailable</title></head>
+<body><p>This preview link is invalid or has expired.</p></body></html>
+"""
 
 
 def render(ad_format, account_name, text, media_kind, media_src):
@@ -60,6 +69,34 @@ background:linear-gradient(transparent,rgba(0,0,0,.7))}}
 text-overflow:ellipsis}}
 </style></head>
 <body><article class="ad {ad_format}">{body}</article></body></html>
+"""
+
+
+def render_share(account_name, ad_id, expires, entries):
+    """Return the page framing every placement. Each entry has format, url, width, height and
+    warnings; the page runs no script."""
+    until = time.strftime("%Y-%m-%d %H:%M", time.gmtime(expires))
+    figures = "".join(
+        f'<figure><figcaption>{escape(entry["format"].capitalize())}</figcaption>'
+        f'<iframe src="{escape(entry["url"])}" width="{entry["width"]}" height="{entry["height"]}" '
+        f'title="{escape(entry["format"].capitalize())} preview of ad #{ad_id}"></iframe>'
+        + "".join(f"<p>{escape(WARNING_TEXT[w])}</p>" for w in entry["warnings"])
+        + "</figure>"
+        for entry in entries)
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Ad preview</title><style>
+body{{margin:0;padding:16px;font:14px/1.4 system-ui,sans-serif;color:#1c1e21;background:#f0f2f5}}
+h1{{margin:0;font-size:18px}}
+.expires{{margin:4px 0 16px;color:#65676b}}
+.frames{{display:flex;flex-wrap:wrap;gap:24px;align-items:flex-start}}
+figure{{margin:0}}
+figcaption{{margin-bottom:4px;font-weight:600}}
+iframe{{display:block;max-width:100%;border:1px solid #ccd0d5;background:#fff}}
+figure p{{margin:4px 0 0;color:#65676b}}
+</style></head>
+<body><h1>Ad preview · {escape(account_name)} · Ad #{ad_id}</h1>
+<p class="expires">Link expires {until} UTC</p>
+<div class="frames">{figures}</div></body></html>
 """
 
 

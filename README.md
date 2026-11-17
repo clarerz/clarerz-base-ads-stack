@@ -83,7 +83,8 @@ Interactive docs are served at `/docs`. Every secret travels as
 `Authorization: Bearer <secret>`; tokens are never read from bodies or query
 strings. `POST /accounts` takes the admin key from `ADS_ADMIN_KEY`; without one,
 no account can be created. Every other authenticated route takes the account's
-access token. JSON bodies hold the same fields as the Python API, and errors
+access token, and each of them also accepts the session cookie with `X-Ads-UI: 1`,
+except `POST /accounts/{account_id}/users`, which only the token opens. JSON bodies hold the same fields as the Python API, and errors
 use the same `{"error_code", "error_message"}` body.
 
 | Method | Path | Auth | Success |
@@ -102,8 +103,9 @@ use the same `{"error_code", "error_message"}` body.
 | `GET` | `/videos/{video_id}` | Account token | 200 video |
 | `PATCH` | `/videos/{video_id}` (`{"name"}`) | Account token | 200 video |
 | `GET` | `/accounts/{account_id}/media/{images\|videos}/{hash}?exp&sig` | Account token or signed URL | 200 file bytes |
-| `GET` | `/accounts/{account_id}/ads/{ad_id}/previews?ad_format=` | Account token | 200 `{"data": [{"format", "preview_url", "width", "height", "warnings"}]}` |
+| `GET` | `/accounts/{account_id}/ads/{ad_id}/previews?ad_format=` | Account token | 200 `{"data": [{"format", "preview_url", "width", "height", "warnings"}], "share_url", "share_expires"}` |
 | `GET` | `/accounts/{account_id}/ads/{ad_id}/previews/{feed\|story\|banner}?exp&sig` | Account token or signed URL | 200 HTML page |
+| `GET` | `/accounts/{account_id}/ads/{ad_id}/share?exp&sig` | Account token or signed URL | 200 HTML page with all three placements |
 | `POST` | `/accounts/{account_id}/users` (`{"username", "password"}`) | Account token, `X-Ads-UI: 1` | 201 `{"username", "account_id"}` |
 | `POST` | `/session` (`{"login", "password"}`) | `X-Ads-UI: 1` | 200 `{"username", "account_id", "account_name"}`, sets `ads_session` |
 | `GET` | `/session` | Session cookie | 200 same body |
@@ -142,7 +144,7 @@ Every request, signed or with a token, checks that the account still owns the
 image or video, so content another account uploaded is not served even when the
 stored bytes are identical. A missing, expired, altered, or revoked signature, media
 the account does not own, and a missing file all return 404 with `002` for `media`. `/media` supports `Range` requests, so videos stream, and sets
-`Cache-Control: private, max-age=<seconds left>, immutable`,
+`Cache-Control: private, max-age=<seconds left, at most 600>, immutable`,
 `X-Content-Type-Options: nosniff`, and `Content-Security-Policy: sandbox`. Files
 are stored without extensions, so the content type comes from their leading
 bytes (PNG, GIF, JPEG, WEBP, MP4, MOV, WebM, Matroska, AVI); anything else, such
@@ -195,6 +197,21 @@ does not own) appears as a labeled "Media unavailable" box. Pages are served wit
 <this server>; style-src 'unsafe-inline'`, `Referrer-Policy: no-referrer` (the page URL
 carries its signature), `X-Content-Type-Options: nosniff`, and `Cache-Control:
 no-store`. Ads are previewed by ID only; ads have no names.
+
+**Share links.** The listing also returns top-level `share_url` and `share_expires` (Unix
+seconds), both `null` without `ADS_MEDIA_KEY`. `share_url` opens
+`GET /accounts/{account_id}/ads/{ad_id}/share`, a static HTML page that frames the feed,
+story, and banner pages, so one link shows an ad in every placement to someone with no
+account. It is valid for 7 days (`api.SHARE_SECONDS`), and the preview and media URLs it
+embeds expire with it. The link is signed like a preview URL, so reissuing the account's
+access token or changing `ADS_MEDIA_KEY` revokes it. Every invalid link (missing, expired,
+altered, revoked, or for an ad the account does not own) gets the same HTML 404, "This
+preview link is invalid or has expired.", so a link reveals nothing about why it failed.
+A bearer token is also accepted on the route; the embedded URLs then last 10 minutes. The
+page is served with `Content-Security-Policy: sandbox; default-src 'none'; frame-src
+<this server>; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'`,
+`Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, and `Cache-Control:
+no-store`. Share links are stateless, so one link cannot be revoked on its own.
 
 The image lookup takes exactly one of `image_hash` or `image_name` and follows
 `get_image` in the Python API; a missing image, another account's image, and a
@@ -265,15 +282,25 @@ login and sessions; the new token can then create a login again.
 the bearer token only when the request has `X-Ads-UI: 1` and no `Authorization`
 header. Cross-origin pages cannot send that header (the server answers no CORS
 preflight), so other sites cannot use the cookie. `POST /accounts` and sign-up read the
-`Authorization` header only. Responses to cookie-authenticated requests carry
-`preview_url: null`; the page shows no previews.
+`Authorization` header only. Responses to cookie-authenticated requests carry working
+signed `preview_url`s, signed with the account's stored token hash. They expire after
+`api.PREVIEW_SECONDS` (600 s); reissuing the access token revokes them, and signing out
+does not.
 
 **The page.** Images and videos are listed separately (25 per page) and either can be
 selected as an ad's media, or an image link entered instead. The account's ads are
 listed newest first, 10 per page. Upload progress, duplicate uploads (409), and API
 errors are shown next to the relevant field; a 401 returns to sign-in. Pages are served
 with a CSP that allows only this server's script, style, and connections, and server
-values are inserted as text only.
+values are inserted as text only. The CSP also allows frames from this server
+(`frame-src 'self'`) for ad previews.
+
+**Previews.** Each ad row has a Preview button. It opens a dialog with the feed, story,
+and banner placements in frames, each with its warnings ("Text is cut off", "Image is
+cropped to fit"). Below them are the ad's share link, its expiry, and a Copy link button
+(if the browser blocks copying, the link text is selected instead). Anyone with the link
+can see the ad for 7 days, and signing out does not revoke it; see Share links above.
+Without `ADS_MEDIA_KEY`, the dialog says previews are unavailable.
 
 Known limits: the throttle is per login, so anyone who knows an account ID (they are
 public) can keep its login failing with one bad attempt every 30 seconds; add per-IP
@@ -541,14 +568,15 @@ URL, URLs valid across processes sharing a key, and revocation when another proc
 reissues the token. Ad previews are driven the way a browser would use them: list an
 ad's previews with the token, open each page by its signed URL, check its headers
 (including a `media-src` naming the real host), and fetch every media link it embeds,
-across server processes and after a token reissued elsewhere.
+across server processes and after a token reissued elsewhere. `tests/test_api.py` checks
+share links: their 7-day lifetime, revocation, and the identical 404 page.
 
 The tests use temporary storage and include fresh-process persistence checks.
 They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The standard-library suite has 135 tests (203 with the HTTP API suites, 222 with the
+The standard-library suite has 135 tests (212 with the HTTP API suites, 240 with the
 browser tests), including boundary cases, storage failures, rollback,
 schema migrations, concurrent SQLite ad ID allocation and registry writes, token
 and ownership enforcement, size limits, and ad, video, and image listings. See

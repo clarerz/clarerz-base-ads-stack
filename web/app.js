@@ -405,7 +405,11 @@ function addAd(ad, atTop = false) {
   const text = cell("span", cut ? `${ad.text.slice(0, TEXT_PREVIEW_LENGTH)}…` : ad.text);
   text.title = ad.text;
   text.className = "ad-text";
-  row.append(link, time, cell("span", adMedia(ad)), text);
+  const preview = cell("button", "Preview");
+  preview.type = "button";
+  preview.setAttribute("aria-label", `Preview ad #${ad.id}`);
+  preview.addEventListener("click", () => openPreview(ad.id));
+  row.append(link, time, cell("span", adMedia(ad)), text, preview);
   $("ad-list")[atTop ? "prepend" : "append"](row);
   $("ad-empty").hidden = true;
 }
@@ -437,6 +441,86 @@ $("ad-more").addEventListener("click", () => loadAds(true));
 // Media first, so ad rows can show image and video names.
 onSignedIn.push(() => { clearAds(); mediaLoaded.then(() => loadAds()); });
 onSignedOut.push(clearAds);
+
+// ---- Ad previews ----
+
+const WARNINGS = { text_truncated: "Text is cut off", media_cropped: "Image is cropped to fit" };
+let previewRequest = 0;  // A response is dropped when a newer openPreview has started.
+
+function closePreview() {
+  previewRequest += 1;
+  // Nothing from the dialog stays in the DOM once it is closed or the session ends.
+  $("preview-frames").replaceChildren();
+  $("preview-share").hidden = true;
+  $("share-link").value = "";
+  if ($("preview-dialog").open) $("preview-dialog").close();  // Returns focus to the opener.
+}
+
+async function openPreview(adId) {
+  const request = ++previewRequest;
+  const dialog = $("preview-dialog");
+  $("preview-heading").textContent = `Preview of ad #${adId}`;
+  $("preview-frames").replaceChildren();
+  $("preview-share").hidden = true;
+  $("share-link").value = "";
+  $("share-expires").textContent = "";
+  $("share-status").textContent = "";
+  $("preview-message").textContent = "Loading preview…";
+  if (!dialog.open) dialog.showModal();
+  try {
+    const page = await api("GET", `/accounts/${session.account_id}/ads/${adId}/previews`);
+    if (request !== previewRequest) return;
+    $("preview-message").textContent = "";
+    if (page.data.some((item) => item.preview_url === null)) {
+      $("preview-message").textContent = "Previews are unavailable on this server.";
+      return;
+    }
+    $("preview-frames").replaceChildren(...page.data.map((item) => {
+      const figure = document.createElement("figure");
+      figure.dataset.format = item.format;
+      const name = item.format.charAt(0).toUpperCase() + item.format.slice(1);
+      const caption = document.createElement("figcaption");
+      caption.textContent = name;
+      const frame = document.createElement("iframe");
+      frame.src = item.preview_url;
+      frame.width = item.width;
+      frame.height = item.height;
+      frame.title = `${name} preview of ad #${adId}`;
+      figure.append(caption, frame);
+      for (const warning of item.warnings) {
+        const note = document.createElement("p");
+        note.className = "warning";
+        note.textContent = WARNINGS[warning] || warning;
+        figure.append(note);
+      }
+      return figure;
+    }));
+    if (page.share_url) {
+      $("share-link").value = page.share_url;
+      $("share-expires").textContent = `Expires ${new Date(page.share_expires * 1000).toLocaleString()}`;
+      $("preview-share").hidden = false;
+    }
+  } catch (error) {
+    if (request !== previewRequest) return;
+    if (sessionEnded(error)) closePreview();
+    else $("preview-message").textContent = error.message;
+  }
+}
+
+$("copy-share").addEventListener("click", async () => {
+  const input = $("share-link");
+  try {
+    await navigator.clipboard.writeText(input.value);
+    $("share-status").textContent = "Link copied";
+  } catch {
+    input.focus();
+    input.select();
+    $("share-status").textContent = "Press Ctrl+C (\u2318C on Mac) to copy";
+  }
+});
+$("preview-close").addEventListener("click", closePreview);
+$("preview-dialog").addEventListener("close", closePreview);  // Escape closes it natively.
+onSignedOut.push(closePreview);
 
 async function start() {
   try {

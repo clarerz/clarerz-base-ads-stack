@@ -18,7 +18,7 @@
 
 ## Coverage
 
-135 standard-library test methods (203 with the HTTP API suites, 222 with the browser tests), with parameterized subtests, cover:
+135 standard-library test methods (212 with the HTTP API suites, 240 with the browser tests), with parameterized subtests, cover:
 
 | Area | Checks |
 | --- | --- |
@@ -30,12 +30,13 @@
 | Listings | Ads, videos, and images: newest-first keyset pagination, tie order, stability across new rows, inclusive/exclusive time filters combined with cursors, invalid parameters, storage failures; image URL, stored dimensions, and the pre-cutoff placeholder; single-image fetch by hash or name. |
 | Previews | Image lookup by hash and name, `preview_url` on image and video listings and video routes, link images previewed by source URL, served bytes with sniffed content types, `Range`, cache lifetime bounded by expiry, security headers; media served only under the owning account, by its token (other and wrong tokens 401) or a URL signed for it; media it does not own 404 even when the bytes are stored; missing, altered, extended, reused (other content, kind, or account), wrong-key, revoked (token reissued), and expired signatures and missing files all 404; no key means no previews, but the token still works. |
 | Ad previews | Every format listed with its size and warnings (cut text, cropped images, none for videos), one format by `ad_format`; pages render link images by link, uploaded images and videos through signed media URLs, video playback per format, a labeled box for unshowable or unowned bytes, per-format text cuts; ad text, account names, and links escaped; page security headers; token required (missing, wrong, other accounts', and non-Bearer tokens 401; accounts with no issued token cannot preview, even with a URL signed over the missing hash), unknown account 400, other accounts' and missing ads 404, unknown format 400; missing, altered, extended, reused (other format, ad, or account, or a media signature), revoked, and expired signatures 404; a preview signature never opens media; media links in a page expire with its preview URL; bearer access to the page; no key means no URLs; storage failures 503. End to end against a real server: image, video, and link ads previewed in every format with their embedded media fetched over HTTP, the CSP `media-src` matching the real host, token rules on both routes, and preview URLs (with their media links) shared across processes until a token reissued in another process revokes them. |
+| Share links | `share_url` and `share_expires` on the previews listing (null without a key); the share page frames feed, story, and banner and carries each format's warnings; valid 7 days, with embedded preview and media URLs expiring with the link; missing, altered, extended, reused (other ad, account, or scope), wrong-key, revoked (token reissued), expired, and other accounts' or missing ads, and a server with no media key (even with a token), all get the same HTML 404; bearer access with 10-minute embedded URLs; security headers; session-cookie previews signed with the stored token hash, surviving sign-out and revoked by reissuing the token; `/media` `max-age` capped at 600 s. |
 | Reads | Full objects, projections of every supported shape including comma-separated strings, invalid projections, missing records, `get_video`. |
 | Image registry | Seeded records, unreadable seed file fails loudly, metadata-only URL ingestion, damaged registry left untouched, interrupted writes keep the previous registry, concurrent URL and file ingestions from several processes all kept. |
 | Extensibility | Extra validation rules, custom publish stage, injected image storage and clock (shared by the service and its default publisher), custom upload and video validators, validator using the publisher's storage. |
 | Web logins | One login per account; ASCII username and password rules with boundaries; case-insensitive usernames; salted scrypt storage; sign-up only by the current access token (never a session); login by username or account ID (not non-ASCII digits); identical failures with exactly one scrypt run each; 30-second throttle after 5 failures; 12-hour expiry; logout; token rotation ends the login and allows a re-claim. |
-| Session cookie | Every account route works with the cookie plus `X-Ads-UI` for its own account only (`/videos/{id}` of others stays 404); ignored without the header or with any `Authorization` header; never the admin key; `Secure`/`HttpOnly`/`SameSite=Strict` attributes and the opt-out; `no-store`; session responses carry no signed URLs. |
-| Web UI | Served files and their CSP and headers, no inline code or HTML insertion; in Chromium: sign-up, sign-in by account ID and keyboard, sign-out, reload, field errors, uploads with selection, duplicates, video name check, paging of media and ads, ad creation with each media source, one source at a time, rows with names and cut text, text-only rendering, and expired sessions returning to sign-in. |
+| Session cookie | Every account route works with the cookie plus `X-Ads-UI` for its own account only (`/videos/{id}` of others stays 404); ignored without the header or with any `Authorization` header; never the admin key; `Secure`/`HttpOnly`/`SameSite=Strict` attributes and the opt-out; `no-store`; session responses carry signed preview URLs that expire in 10 minutes. |
+| Web UI | Served files and their CSP and headers, no inline code or HTML insertion; in Chromium: sign-up, sign-in by account ID and keyboard, sign-out, reload, field errors, uploads with selection, duplicates, video name check, paging of media and ads, ad creation with each media source, one source at a time, rows with names and cut text, text-only rendering, and expired sessions returning to sign-in. Preview dialog: three placements with warnings, share link and expiry, copy fallback, close button, share link surviving sign-out, expired session closing the dialog, and a no-key message. |
 | Persistence | Fresh-process reads, versioned migration of legacy and v1 schemas (once, concurrently, without locking current databases), repair of early `image_owners` shapes, the ads-by-creator index, failed-insert rollback, concurrent ad ID allocation, `003` error dictionaries for storage failures. |
 
 ## Regression detection
@@ -76,7 +77,7 @@ mutation score or a proof of correctness.
 
 ## Result and limits
 
-All 135 standard-library tests pass using:
+All 135 standard-library tests pass with the command below. Without the dev dependencies the HTTP API and browser suites are skipped (139 run, 4 skipped); with them, all 240 pass.
 
 ```bash
 python3 -m unittest discover -s tests -v

@@ -42,6 +42,7 @@ ROUTES = {"/accounts", "/accounts/{account_id}", "/accounts/{account_id}/ads",
           "/accounts/{account_id}/media/{kind}/{media_hash}",
           "/accounts/{account_id}/ads/{ad_id}/previews",
           "/accounts/{account_id}/ads/{ad_id}/previews/{ad_format}",
+          "/accounts/{account_id}/ads/{ad_id}/share",
           "/accounts/{account_id}/users", "/session"}
 
 

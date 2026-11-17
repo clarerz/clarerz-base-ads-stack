@@ -1,7 +1,9 @@
 """HTTP sign-up, login, and session routes through FastAPI's TestClient."""
 
+import html
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -205,8 +207,6 @@ class CookieAuthTests(ApiLoginCase):
         image_hash = response.json()["hash"]
         images = self.client.get("/accounts/42/images", headers=UI).json()["data"]
         self.assertEqual([image["hash"] for image in images], [image_hash])
-        # Session callers get no signed media URLs (they would not verify).
-        self.assertIsNone(images[0]["preview_url"])
         lookup = self.client.get("/accounts/42/images/lookup", params={"image_name": "Hero"},
                                  headers=UI)
         self.assertEqual(lookup.json()["hash"], image_hash)
@@ -214,8 +214,7 @@ class CookieAuthTests(ApiLoginCase):
         self.assertEqual(response.status_code, 201, response.text)
         video_id = response.json()["id"]
         videos = self.client.get("/accounts/42/videos", headers=UI).json()["data"]
-        self.assertEqual([(video["id"], video["preview_url"]) for video in videos],
-                         [(video_id, None)])
+        self.assertEqual([video["id"] for video in videos], [video_id])
         self.assertEqual(self.client.get(f"/videos/{video_id}", headers=UI).json()["name"],
                          "Clip")
         renamed = self.client.patch(f"/videos/{video_id}", json={"name": "Cut"}, headers=UI)
@@ -225,6 +224,56 @@ class CookieAuthTests(ApiLoginCase):
         self.assertEqual(ad.status_code, 201, ad.text)
         account = self.client.patch("/accounts/42", json={"name": "Acme Two"}, headers=UI)
         self.assertEqual(account.json(), {"id": 42, "name": "Acme Two"})
+
+    def test_sessions_get_verifiable_signed_urls(self):
+        image = self.upload("images", PNG, filename="a.png", image_name="Hero").json()["hash"]
+        video = self.upload("videos", MP4, filename="v.mp4", name="Clip").json()["id"]
+        ad = self.client.post("/accounts/42/ads", json={"text": "Fresh picks this week",
+                                                       "image_hash": image}, headers=UI)
+        self.assertEqual(ad.status_code, 201, ad.text)
+        get = lambda path, **params: self.client.get(path, params=params, headers=UI).json()
+        media = [get("/accounts/42/images")["data"][0], get("/accounts/42/videos")["data"][0],
+                 get("/accounts/42/images/lookup", image_name="Hero"), get(f"/videos/{video}")]
+        pages = get("/accounts/42/ads/1/previews")["data"]
+        media_urls = [item["preview_url"] for item in media]
+        page_urls = [item["preview_url"] for item in pages]
+        self.assertTrue(page_urls)
+        anonymous = TestClient(self.client.app, base_url="https://testserver")
+        for url in media_urls + page_urls:
+            with self.subTest(url=url):
+                self.assertIsInstance(url, str)
+                self.assertIn("sig=", url)
+                self.assertEqual(anonymous.get(url).status_code, 200)
+        self.service_obj.issue_access_token(42)
+        for urls, field in ((media_urls, "media"), (page_urls, "preview")):
+            for url in urls:
+                with self.subTest(revoked=url):
+                    self.assert_error(anonymous.get(url), 404, "002", field)
+
+    def test_cookie_fetched_pages_embed_working_urls(self):
+        image = self.upload("images", PNG, filename="a.png").json()["hash"]
+        ad = self.client.post("/accounts/42/ads", json={"text": "Fresh picks this week",
+                                                       "image_hash": image}, headers=UI)
+        self.assertEqual(ad.status_code, 201, ad.text)
+        page = self.client.get("/accounts/42/ads/1/previews/feed", headers=UI)
+        self.assertEqual(page.status_code, 200, page.text)
+        src = html.unescape(re.search(r'<img[^>]*\ssrc="([^"]+)"', page.text).group(1))
+        anonymous = TestClient(self.client.app, base_url="https://testserver")
+        self.assertEqual(anonymous.get(src).status_code, 200)
+
+    def test_cookie_fetched_share_page_frames_verify(self):
+        image = self.upload("images", PNG, filename="a.png").json()["hash"]
+        ad = self.client.post("/accounts/42/ads", json={"text": "Fresh picks this week",
+                                                       "image_hash": image}, headers=UI)
+        self.assertEqual(ad.status_code, 201, ad.text)
+        page = self.client.get("/accounts/42/ads/1/share", headers=UI)
+        self.assertEqual(page.status_code, 200, page.text)
+        frames = [html.unescape(src) for src in re.findall(r'<iframe src="([^"]+)"', page.text)]
+        self.assertEqual(len(frames), 3)
+        anonymous = TestClient(self.client.app, base_url="https://testserver")
+        for src in frames:
+            with self.subTest(src=src):
+                self.assertEqual(anonymous.get(src).status_code, 200)
 
     def test_the_cookie_only_counts_for_its_own_account(self):
         video = self.client.post("/accounts/7/videos", content=MP4,
@@ -276,8 +325,8 @@ class UiRouteTests(ApiLoginCase):
                 self.assertTrue(response.headers["content-type"].startswith(content_type))
                 self.assertEqual(response.headers["content-security-policy"],
                                  "default-src 'none'; script-src 'self'; style-src 'self'; "
-                                 "connect-src 'self'; img-src 'self'; form-action 'self'; "
-                                 "frame-ancestors 'none'; base-uri 'none'")
+                                 "connect-src 'self'; img-src 'self'; frame-src 'self'; "
+                                 "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
                 self.assertEqual(response.headers["x-content-type-options"], "nosniff")
                 self.assertEqual(response.headers["referrer-policy"], "no-referrer")
                 self.assertEqual(response.headers["cache-control"], "no-store")

@@ -31,6 +31,7 @@ MAX_JSON_BYTES = 64 * 1024
 # Preview URLs let <img> and <video> load stored bytes, which they cannot do with a bearer
 # token; each URL is signed for one account's file and expires after this many seconds.
 PREVIEW_SECONDS = 600
+SHARE_SECONDS = 7 * 24 * 3600
 MEDIA_DIRS = {"images": Path(image_store._PERSIST_DIR), "videos": video_store.VIDEO_DIR}
 # Upload routes stream their bodies to disk under their own limits; other bodies are JSON.
 _UPLOAD_PATH = re.compile(r"/accounts/[^/]+/(images|videos)")
@@ -314,7 +315,8 @@ async def upload_image(account_id: str, request: Request, filename: str | None =
 def list_images(account_id: str, request: Request, page=Depends(page_params),
                 token=Depends(bearer_token), service=Depends(get_service)):
     images, next_cursor = call("image", service.list_images, account_id, token, *page)
-    return {"data": [image_json(request, token, image) for image in images],
+    token_hash = signing_hash(request, coerce_id(account_id), token)
+    return {"data": [image_json(request, token_hash, image) for image in images],
             "next_cursor": next_cursor}
 
 
@@ -325,7 +327,7 @@ def get_image(account_id: str, request: Request, image_hash: str | None = None,
               service=Depends(get_service)):
     image = call("image", service.get_image, account_id, token, image_hash, image_name,
                  not_found=("image_hash", "image_name"))
-    return image_json(request, token, image)
+    return image_json(request, signing_hash(request, coerce_id(account_id), token), image)
 
 
 @router.post("/accounts/{account_id}/videos", status_code=201)
@@ -354,7 +356,8 @@ async def upload_video(account_id: str, request: Request, filename: str | None =
 def list_videos(account_id: str, request: Request, page=Depends(page_params),
                 token=Depends(bearer_token), service=Depends(get_service)):
     videos, next_cursor = call("video", service.list_videos, account_id, token, *page)
-    return {"data": [video_json(request, token, video) for video in videos],
+    token_hash = signing_hash(request, coerce_id(account_id), token)
+    return {"data": [video_json(request, token_hash, video) for video in videos],
             "next_cursor": next_cursor}
 
 
@@ -362,16 +365,17 @@ def list_videos(account_id: str, request: Request, page=Depends(page_params),
 @router.get("/videos/{video_id}")
 def get_video(video_id: str, request: Request, token=Depends(bearer_token),
               service=Depends(get_service)):
-    return video_json(request, token, call("video", service.get_video, video_id, token,
-                                           not_found=("video_id",)))
+    video = call("video", service.get_video, video_id, token, not_found=("video_id",))
+    return video_json(request, signing_hash(request, video.owner_id, token), video)
 
 
 @router.patch("/videos/{video_id}")
 def rename_video(video_id: str, request: Request, body: dict = Body(...),
                  token=Depends(bearer_token), service=Depends(get_service)):
     data = check_fields(body, {"name"})
-    return video_json(request, token, call("video", service.rename_video, video_id,
-                                           data.get("name"), token, not_found=("video_id",)))
+    video = call("video", service.rename_video, video_id, data.get("name"), token,
+                 not_found=("video_id",))
+    return video_json(request, signing_hash(request, video.owner_id, token), video)
 
 
 def media_signature(key, account_id, kind, media_hash, expires, token_hash):
@@ -384,12 +388,11 @@ def signed_url(request, token_hash, owner_id, scope, subject, route, expires=Non
     """Return a URL for route signed for owner_id's scope and subject, valid until expires
     (default: PREVIEW_SECONDS from now).
 
-    None without a key, and for requests authenticated by session cookie, whose token hash is
-    not the account's. Only callers that have authenticated owner_id (by token or signed URL)
-    call this; token_hash is the account's current one.
+    None without a key. Only callers that have authenticated owner_id (by token, session, or
+    signed URL) call this; token_hash is the account's current one (see signing_hash).
     """
     key = request.app.state.media_key
-    if not key or getattr(request.state, "session_auth", False):
+    if not key:
         return None
     if expires is None:
         expires = int(request.app.state.service.clock()) + PREVIEW_SECONDS
@@ -403,6 +406,17 @@ def media_url(request, token_hash, kind, owner_id, media_hash, expires=None):
                       kind=kind, media_hash=media_hash)
 
 
+def signing_hash(request, owner_id, token):
+    """Return the token hash to sign owner_id's URLs with, for a request already authenticated.
+
+    A session's token is a session ID, not the account's token, so its URLs are signed with the
+    account's stored hash; that is what signed_access checks them against.
+    """
+    if getattr(request.state, "session_auth", False):
+        return call("account", request.app.state.service.repository.get_token_hash, owner_id)
+    return hash_token(token)
+
+
 def signed_access(request, owner_id, token, exp, sig, scope, subject, field):
     """Return (expiry, token hash) for a request with owner_id's token or a live URL signed for
     scope and subject, or None for any bad signature. A wrong token raises 401."""
@@ -412,7 +426,7 @@ def signed_access(request, owner_id, token, exp, sig, scope, subject, field):
     if token is not None:
         # Like every account route, a wrong token is a 401 before anything is looked up.
         authenticate(repository, owner_id, token)
-        return now + PREVIEW_SECONDS, hash_token(token)
+        return now + PREVIEW_SECONDS, signing_hash(request, owner_id, token)
     expires = coerce_id(exp)
     token_hash = (call(field, repository.get_token_hash, owner_id)
                   if owner_id is not None else None)
@@ -423,15 +437,15 @@ def signed_access(request, owner_id, token, exp, sig, scope, subject, field):
     return (expires, token_hash) if valid else None
 
 
-def image_json(request, token, image):
+def image_json(request, token_hash, image):
     # Link-ingested images have no stored bytes; their source link is the preview.
     return {**image.to_dict(), "preview_url": image.image_url or media_url(
-        request, hash_token(token), "images", image.owner_id, image.hash)}
+        request, token_hash, "images", image.owner_id, image.hash)}
 
 
-def video_json(request, token, video):
+def video_json(request, token_hash, video):
     return {**video.to_dict(), "preview_url": media_url(
-        request, hash_token(token), "videos", video.owner_id, video.video_hash)}
+        request, token_hash, "videos", video.owner_id, video.video_hash)}
 
 
 def owns_media(repository, owner_id, kind, media_hash):
@@ -481,9 +495,11 @@ def get_media(account_id: str, kind: str, media_hash: str, request: Request,
     except OSError as exc:
         raise StorageError("media") from exc
     # The bytes behind a hash never change, so they can be cached until the URL expires
-    # (for one URL lifetime when fetched with the token).
+    # (for one URL lifetime when fetched with the token). A share link's media is cached for
+    # at most PREVIEW_SECONDS, so revoking the account's token takes effect soon after.
+    now = int(service.clock())
     return FileResponse(path, media_type=content_type, headers={
-        "Cache-Control": f"private, max-age={access[0] - int(service.clock())}, immutable",
+        "Cache-Control": f"private, max-age={min(access[0] - now, PREVIEW_SECONDS)}, immutable",
         "X-Content-Type-Options": "nosniff",
         "Content-Security-Policy": "sandbox",
     })
@@ -502,6 +518,14 @@ def _ad_image(service, ad):
     owned = image is not None
     image = image or Image(ad.image_hash, ad.creator_id, ad.creation_time)
     return service.describe_image(image), owned
+
+
+def _ad_size(service, ad):
+    """Return the (width, height) of the ad's image, or (None, None) for a video ad."""
+    if ad.image_hash is None:
+        return None, None
+    image = _ad_image(service, ad)[0]
+    return image.width, image.height
 
 
 def _stored_media_src(request, access, kind, owner_id, media_hash):
@@ -548,18 +572,68 @@ def list_ad_previews(account_id: str, ad_id: str, request: Request,
     if ad_format is not None and ad_format not in previews.FORMATS:
         raise ValidationError("002", "ad_format")
     ad = found(call("ad", _account_ad, service, owner_id, ad_id), "ad_id")
-    width = height = None
-    if ad.image_hash is not None:
-        image = call("image", _ad_image, service, ad)[0]
-        width, height = image.width, image.height
-    token_hash = hash_token(token)
+    width, height = call("image", _ad_size, service, ad)
+    token_hash = signing_hash(request, owner_id, token)
+    share_expires = int(service.clock()) + SHARE_SECONDS
+    share_url = signed_url(request, token_hash, owner_id, "share", ad.id, "get_ad_share",
+                           expires=share_expires, ad_id=ad.id)
     return {"data": [
         {"format": name,
          "preview_url": signed_url(request, token_hash, owner_id, f"preview:{name}", ad.id,
                                    "get_ad_preview", ad_id=ad.id, ad_format=name),
          "width": spec["width"], "height": spec["height"],
          "warnings": previews.warnings(name, ad.text, width, height)}
-        for name, spec in previews.FORMATS.items() if ad_format in (None, name)]}
+        for name, spec in previews.FORMATS.items() if ad_format in (None, name)],
+        "share_url": share_url, "share_expires": share_expires if share_url else None}
+
+
+def share_page(request, owner_id, ad_id, access):
+    """Return the HTML page framing the account's ad in every format, or None if there is none.
+
+    access is the (expiry, token hash) the request was granted; every frame URL carries both,
+    so nothing on the page outlives the link or the account's token.
+    """
+    service = request.app.state.service
+    ad = _account_ad(service, owner_id, ad_id)
+    # Without a media key there are no signed frame URLs to put on the page.
+    if ad is None or not request.app.state.media_key:
+        return None
+    expires, token_hash = access
+    width, height = _ad_size(service, ad)
+    entries = [{"format": name,
+                "url": signed_url(request, token_hash, owner_id, f"preview:{name}", ad.id,
+                                  "get_ad_preview", expires=expires, ad_id=ad.id,
+                                  ad_format=name),
+                "width": spec["width"], "height": spec["height"],
+                "warnings": previews.warnings(name, ad.text, width, height)}
+               for name, spec in previews.FORMATS.items()]
+    account = service.repository.get_account(owner_id)
+    return previews.render_share(account.name, ad.id, expires, entries)
+
+
+@router.get("/accounts/{account_id}/ads/{ad_id}/share", name="get_ad_share")
+def get_ad_share(account_id: str, ad_id: str, request: Request, exp: str | None = None,
+                 sig: str | None = None, token=Depends(bearer_token)):
+    """Serve the share page for the account's token, or for a share URL issued to it."""
+    owner_id = coerce_id(account_id)
+    access = signed_access(request, owner_id, token, exp, sig, "share", ad_id, "share")
+    page = access is not None and call("share", share_page, request, owner_id, ad_id, access)
+    origin = f"{request.url.scheme}://{request.url.netloc}"
+    headers = {
+        # No scripts run, the page gets an opaque origin, and it frames only this server's
+        # preview pages (signed URLs).
+        "Content-Security-Policy": f"sandbox; default-src 'none'; frame-src {origin}; "
+                                   "style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+        "X-Content-Type-Options": "nosniff",
+        # The page URL carries its signature.
+        "Referrer-Policy": "no-referrer",
+        # Frame URLs expire, so a cached page would go stale.
+        "Cache-Control": "no-store",
+    }
+    # Every rejection gets the same page, so a link reveals nothing about why it failed.
+    if not page:
+        return HTMLResponse(previews.SHARE_NOT_FOUND, 404, headers=headers)
+    return HTMLResponse(page, headers=headers)
 
 
 @router.get("/accounts/{account_id}/ads/{ad_id}/previews/{ad_format}", name="get_ad_preview")
@@ -593,8 +667,8 @@ UI_ASSETS = {"app.js": "text/javascript", "app.css": "text/css"}
 UI_HEADERS = {
     # Scripts and styles come only from the files below; API calls only to this server.
     "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; "
-                               "connect-src 'self'; img-src 'self'; form-action 'self'; "
-                               "frame-ancestors 'none'; base-uri 'none'",
+                               "connect-src 'self'; img-src 'self'; frame-src 'self'; "
+                               "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store",
