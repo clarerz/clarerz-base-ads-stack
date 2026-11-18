@@ -156,6 +156,137 @@ class ApiTests(unittest.TestCase):
                           400, "002", "creator_id")
         self.assertIsNone(self.publish.get_ads(1))
 
+    def update_ad(self, ad_id=1, token=None, account_id=1, **body):
+        return self.client.patch(f"/accounts/{account_id}/ads/{ad_id}", json=body,
+                                 headers=self.bearer(token or self.token))
+
+    def test_patch_edits_text(self):
+        self.assertEqual(self.publish_ad().status_code, 201)
+        before = self.client.get("/ads/1").json()
+        self.now += 30
+        response = self.update_ad(text="  New ad copy  ")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {**before, "text": "New ad copy", "update_time": self.now})
+        self.assertEqual(self.client.get("/ads/1").json(), response.json())
+        for text in ("ab", "https://x.example/a", "f" * 16):
+            self.assert_error(self.update_ad(text=text), 400, "002", "text")
+
+    def test_patch_body_shape(self):
+        self.assertEqual(self.publish_ad().status_code, 201)
+        for body, code, field in (({}, "002", "body"), ({"creator_id": 1}, "001", "creator_id"),
+                                  ({"access_token": "x"}, "001", "access_token"),
+                                  ({"text": "Fine text", "x": 1}, "001", "x"),
+                                  ({"image": "https://a.example/a.png", "video_id": 1}, "002", "video_id"),
+                                  ({"image_name": "A", "image_hash": "a" * 32}, "002", "image_name")):
+            with self.subTest(body=body):
+                # The same result for an unknown account and with no token.
+                self.assert_error(self.update_ad(account_id=999, token="nope", **body),
+                                  400, code, field)
+                self.assert_error(self.client.patch("/accounts/1/ads/1", json=body),
+                                  400, code, field)
+        self.assert_error(self.client.patch("/accounts/1/ads/1", json=[1],
+                                            headers=self.bearer(self.token)),
+                          400, "002", "body")
+
+    def test_patch_authenticates_and_hides_other_ads(self):
+        self.assertEqual(self.publish_ad().status_code, 201)
+        other = self.create_account(2, "Advertiser Two")
+        self.assertEqual(self.client.post("/accounts/2/ads", json={
+            "text": VALID_TEXT, "image": self.seeded[0]["url"]}, headers=self.bearer(other)
+        ).status_code, 201)
+        before = self.client.get("/ads/1").json()
+        self.assert_error(self.update_ad(account_id=999, text="New ad copy"), 400, "002", "creator_id")
+        for headers in ({}, self.bearer("wrong"), {"Authorization": "Basic " + self.token}):
+            with self.subTest(headers=headers):
+                self.assert_error(self.client.patch("/accounts/1/ads/1", json={"text": "New ad copy"},
+                                                    headers=headers), 401, "002", "access_token")
+        responses = [self.update_ad(ad_id=2, text="New ad copy"),
+                     self.update_ad(ad_id=999, text="New ad copy"),
+                     self.update_ad(ad_id="abc", text="New ad copy")]
+        for response in responses:
+            self.assert_error(response, 404, "002", "ad_id")
+        self.assertEqual(len({response.content for response in responses}), 1)
+        self.assertEqual(self.client.get("/ads/1").json(), before)
+        self.assertEqual(self.client.get("/ads/2").json()["text"], VALID_TEXT)
+
+    def test_patch_rejects_type_change(self):
+        image_hash = self.upload_image(PNG, image_name="hero").json()["hash"]
+        self.assertEqual(self.upload_video(MP4).status_code, 201)
+        self.assertEqual(self.publish_ad().status_code, 201)
+        self.assertEqual(self.publish_ad(video_id=1).status_code, 201)
+        before = [self.client.get(f"/ads/{ad_id}").json() for ad_id in (1, 2)]
+        cases = ((1, {"video_id": 1}, "video_id"), (2, {"image_hash": image_hash}, "image_hash"),
+                 (2, {"image_name": "hero"}, "image_name"),
+                 (2, {"image": self.seeded[0]["url"]}, "image"))
+        for ad_id, body, field in cases:
+            with self.subTest(ad_id=ad_id, body=body):
+                self.assert_error(self.update_ad(ad_id=ad_id, **body), 400, "002", field)
+                self.assert_error(self.update_ad(ad_id=ad_id, token="wrong", **body),
+                                  401, "002", "access_token")
+        self.assertEqual([self.client.get(f"/ads/{ad_id}").json() for ad_id in (1, 2)], before)
+
+    def owned_hashes(self):
+        with sqlite3.connect(self.publish.DB_PATH) as conn:
+            return sorted(row[0] for row in conn.execute("SELECT image_hash FROM image_owners"))
+
+    def test_patch_replaces_media(self):
+        first = self.upload_image(b"first", image_name="first").json()["hash"]
+        second = self.upload_image(b"second", image_name="second").json()["hash"]
+        self.assertEqual(self.publish_ad(image_hash=first).status_code, 201)
+        for body, expected in (({"image_hash": second}, second), ({"image_name": "first"}, first)):
+            with self.subTest(body=body):
+                response = self.update_ad(**body)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["image_hash"], expected)
+                self.assertEqual(self.client.get("/ads/1").json()["image_hash"], expected)
+        response = self.update_ad(image=self.seeded[1]["url"])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["image_hash"], self.seeded[1]["hash"])
+        self.assertIn(self.seeded[1]["hash"], self.owned_hashes())
+        # An unowned image, by hash or by name, is refused.
+        self.create_account(2, "Advertiser Two")
+        other = self.create_account(3, "Advertiser Three")
+        foreign = self.client.post("/accounts/3/images", content=b"foreign",
+                                   params={"filename": "f.png", "image_name": "foreign"},
+                                   headers=self.bearer(other)).json()["hash"]
+        before = self.client.get("/ads/1").json()
+        for body, field in (({"image_hash": foreign}, "image_hash"),
+                            ({"image_name": "foreign"}, "image_name")):
+            with self.subTest(body=body):
+                self.assert_error(self.update_ad(**body), 400, "002", field)
+        # A rejected edit leaves the image ownership table alone.
+        owners = self.owned_hashes()
+        self.assert_error(self.update_ad(text="ab", image=self.seeded[2]["url"]), 400, "002", "text")
+        self.assertEqual(self.owned_hashes(), owners)
+        self.assertEqual(self.client.get("/ads/1").json(), before)
+        # Video ads swap their video; an unowned or missing video is refused.
+        video = self.upload_video(MP4, name="One")
+        self.assertEqual(self.publish_ad(video_id=video.json()["id"]).status_code, 201)
+        self.assertEqual(self.upload_video(MP4 + b"2", name="Two").status_code, 201)
+        response = self.update_ad(ad_id=2, video_id=2)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["video_id"], 2)
+        for video_id in (99, "abc"):
+            self.assert_error(self.update_ad(ad_id=2, video_id=video_id), 400, "002", "video_id")
+        self.assertEqual(self.client.get("/ads/2").json()["video_id"], 2)
+
+    def test_patch_without_publisher_update_is_503(self):
+        class PublishOnly:
+            def __init__(self, inner):
+                self.publish = inner.publish
+
+        self.assertEqual(self.publish_ad().status_code, 201)
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        service = self.service.AdsService(
+            repository, publisher=PublishOnly(self.publishing.AdPublisher(repository)),
+            clock=lambda: self.now)
+        client = TestClient(self.api.create_app(service=service, admin_key=ADMIN_KEY))
+        before = client.get("/ads/1").json()
+        response = client.patch("/accounts/1/ads/1", json={"text": "New ad copy"},
+                                headers=self.bearer(self.token))
+        self.assert_error(response, 503, "003", "ad")
+        self.assertEqual(client.get("/ads/1").json(), before)
+
     def test_list_ads_pages_without_token(self):
         for _ in range(3):
             self.assertEqual(self.publish_ad().status_code, 201)
@@ -550,7 +681,8 @@ class ApiTests(unittest.TestCase):
     def test_json_bodies_are_capped_before_auth(self):
         oversized = b"x" * (self.api.MAX_JSON_BYTES + 1)
         for path, method in (("/accounts", "POST"), ("/accounts/1", "PATCH"),
-                             ("/accounts/1/ads", "POST"), ("/videos/1", "PATCH")):
+                             ("/accounts/1/ads", "POST"), ("/accounts/1/ads/1", "PATCH"),
+                             ("/videos/1", "PATCH")):
             with self.subTest(path=path):
                 self.assert_error(self.client.request(method, path, content=oversized),
                                   413, "002", "body")
@@ -602,6 +734,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         data = response.json()["data"]
         urls = [entry.pop("preview_url") for entry in data]
+        texts = [entry.pop("text") for entry in data]
+        self.assertEqual(texts, [VALID_TEXT, VALID_TEXT, VALID_TEXT[:40].rstrip() + "…"])
         # VALID_TEXT is longer than a banner's 40 characters.
         self.assertEqual(data, [
             {"format": "feed", "width": 500, "height": 640, "warnings": []},
@@ -626,6 +760,62 @@ class ApiTests(unittest.TestCase):
         warnings = [entry["warnings"] for entry in self.previews(3).json()["data"]]
         self.assertEqual(warnings, [[], [], []])
 
+    def test_listing_reports_text_and_media(self):
+        link = self.seeded[0]["url"]
+        emoji = "🎉" * 39 + "ab cd"  # 44 code points, more than banner's 40.
+        self.assertEqual(self.publish_ad(image=link, text=emoji).status_code, 201)
+        body = self.previews().json()
+        self.assertEqual(body["media"], {"kind": "image", "url": link})
+        urls = self.preview_urls()
+        for entry in body["data"]:
+            page = self.preview_page(urls[entry["format"]])
+            self.assertIn(html.escape(entry["text"]), page)
+        self.assertEqual(body["data"][2]["text"], "🎉" * 39 + "a…")
+        # Owned uploaded bytes: a signed URL valid for PREVIEW_SECONDS.
+        image_hash = self.upload_image(PNG).json()["hash"]
+        self.assertEqual(self.publish_ad(image_hash=image_hash).status_code, 201)
+        media = self.previews(2).json()["media"]
+        self.assertEqual(media["kind"], "image")
+        self.assertTrue(media["url"].startswith(
+            f"http://testserver/accounts/1/media/images/{image_hash}?exp={self.now + 600}&sig="))
+        self.assert_media(media["url"], PNG, "image/png")
+        # Undisplayable bytes -> None; a video -> kind "video".
+        placeholder = self.upload_image(b"not an image").json()["hash"]
+        self.assertEqual(self.publish_ad(image_hash=placeholder).status_code, 201)
+        self.assertEqual(self.previews(3).json()["media"], {"kind": "image", "url": None})
+        self.assertEqual(self.upload_video(MP4).status_code, 201)
+        self.assertEqual(self.publish_ad(video_id=1).status_code, 201)
+        media = self.previews(4).json()["media"]
+        self.assertEqual(media["kind"], "video")
+        self.assertTrue(media["url"].startswith("http://testserver/accounts/1/media/videos/"))
+        self.assert_media(media["url"], MP4, "video/mp4")
+        # A legacy ad (no ownership row) naming a seeded link's hash still shows the link.
+        seeded_hash = self.seeded[1]["hash"]
+        draft = self.models.AdDraft(1, VALID_TEXT, image_hash=seeded_hash)
+        self.client.app.state.service.repository.save_ad(draft, self.now)
+        self.assertEqual(self.previews(5).json()["media"],
+                         {"kind": "image", "url": self.seeded[1]["url"]})
+        # Without a media key, only links remain.
+        self.client = self.make_client(None)
+        self.assertEqual(self.previews(1).json()["media"], {"kind": "image", "url": link})
+        self.assertEqual(self.previews(2).json()["media"], {"kind": "image", "url": None})
+        self.assertEqual(self.previews(4).json()["media"], {"kind": "video", "url": None})
+
+    def test_story_video_has_controls(self):
+        self.assertEqual(self.upload_video(MP4).status_code, 201)
+        self.assertEqual(self.publish_ad(video_id=1).status_code, 201)
+        page = self.preview_page(self.preview_urls()["story"])
+        # The text overlay must not catch clicks meant for the controls bar.
+        self.assertRegex(page, r"\.ad\.story \.text\{[^}]*pointer-events:none")
+
+    def test_preview_css_sizes_match_formats(self):
+        css = (Path(self.api.WEB_DIR) / "preview.css").read_text()
+        for name, spec in self.api.previews.FORMATS.items():
+            self.assertIn(f".ad.{name}{{width:{spec['width']}px;height:{spec['height']}px}}", css)
+            width, height = spec["media"]
+            self.assertIn(f".ad.{name} .media{{width:{width}px;height:{height}px}}", css)
+        self.assertNotRegex(css, r"(^|\})\s*(body|\*|header)\s*[{,]")
+
     def test_preview_pages_render_each_format(self):
         link = self.seeded[0]
         self.assertEqual(self.publish_ad(image=link["url"]).status_code, 201)
@@ -644,11 +834,11 @@ class ApiTests(unittest.TestCase):
                 self.assertTrue(src.startswith(
                     f"http://testserver/accounts/1/media/images/{image_hash}?exp="), src)
                 self.assert_media(src, PNG, "image/png")
-        # Video plays muted in every format; only the story autoplays.
+        # Every format has controls; only the story autoplays.
         self.assertEqual(self.upload_video(MP4).status_code, 201)
         self.assertEqual(self.publish_ad(video_id=1).status_code, 201)
         pages = {name: self.preview_page(url) for name, url in self.preview_urls(3).items()}
-        self.assertIn("autoplay muted loop playsinline", pages["story"])
+        self.assertIn("controls autoplay muted loop playsinline", pages["story"])
         for name in ("feed", "banner"):
             self.assertIn("controls muted playsinline", pages[name])
             self.assertNotIn("autoplay", pages[name])
@@ -888,6 +1078,24 @@ class ApiTests(unittest.TestCase):
         self.assertIn("Link expires " + time.strftime("%Y-%m-%d %H:%M", time.gmtime(expires))
                       + " UTC", page)
         self.assertEqual(self.share(self.share_url(2)).text.count("Text is cut off"), 1)
+
+    def test_share_page_shows_edit(self):
+        self.assertEqual(self.publish_ad().status_code, 201)
+        url = self.share_url()
+        self.assertEqual(self.update_ad(text="Edited share copy").status_code, 200)
+        page = self.share(url).text
+        story = next(src for src, _, _ in self.frames(page) if "/previews/story" in src)
+        self.assertIn("Edited share copy", self.preview_page(story))
+        self.assertNotIn(VALID_TEXT, page)
+
+    def test_share_page_shows_last_edited(self):
+        self.assertEqual(self.publish_ad().status_code, 201)
+        self.assertNotIn("Last edited", self.share(self.share_url()).text)
+        self.now += 3600
+        self.assertEqual(self.update_ad(text="Edited copy").status_code, 200)
+        page = self.share(self.share_url()).text
+        self.assertIn("Last edited " + time.strftime("%Y-%m-%d %H:%M", time.gmtime(self.now))
+                      + " UTC", page)
 
     def test_nothing_outlives_the_share_link(self):
         image_hash = self.upload_image(PNG).json()["hash"]

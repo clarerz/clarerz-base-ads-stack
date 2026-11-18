@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -94,6 +95,37 @@ class AdsStackTests(unittest.TestCase):
             with self.subTest(account_id=account_id):
                 self.assertIsNone(self.publish.get_account(account_id))
 
+    def test_repository_update_ad(self):
+        from dataclasses import replace
+        repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        ad = repository.save_ad(self.models.AdDraft(1, VALID_TEXT, image_hash="a" * 32), 1000)
+        self.assertIsNone(ad.update_time)
+        draft = self.models.AdDraft(1, "New text here", image_hash="b" * 32, ad_id=ad.id)
+        updated = repository.update_ad(draft, 2000)
+        self.assertEqual(updated, replace(ad, text="New text here", image_hash="b" * 32,
+                                          update_time=2000))
+        self.assertEqual(repository.get_ad(ad.id), updated)
+        self.assertEqual(repository.list_ads(1, 10), [updated])
+        # Defense in depth: another creator's draft matches no row.
+        self.assertIsNone(repository.update_ad(replace(draft, creator_id=2), 3000))
+        self.assertEqual(repository.get_ad(ad.id), updated)
+
+    def test_schema_v4_adds_update_time(self):
+        import sqlite3
+        path = self.data_dir / "v3.db"
+        self.repository.SQLiteAdsRepository(path)
+        with closing(sqlite3.connect(path)) as conn, conn:
+            conn.execute("ALTER TABLE ads DROP COLUMN update_time")
+            conn.execute("INSERT INTO ads (id, system_name, image_hash, text_content, creator_id, "
+                         "creation_time, video_id) VALUES (5, 'ad_5', ?, 'Old ad', 1, 10, NULL)",
+                         ("c" * 32,))
+            conn.execute("PRAGMA user_version = 3")
+        repository = self.repository.SQLiteAdsRepository(path)
+        self.assertIsNone(repository.get_ad(5).update_time)
+        self.repository.SQLiteAdsRepository(path)  # Repeating the migration is harmless.
+        with closing(sqlite3.connect(path)) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+
     def test_published_image_ad_record(self):
         before = int(time.time())
         ids = [self.publish_ok(), self.publish_ok()]
@@ -107,7 +139,7 @@ class AdsStackTests(unittest.TestCase):
             self.assertEqual(ad, {"id": ad_id, "system_name": f"ad_{ad_id}",
                                   "image_hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4", "text": VALID_TEXT,
                                   "creator_id": 1, "creation_time": ad["creation_time"],
-                                  "video_id": None})
+                                  "video_id": None, "update_time": None})
 
     def test_image_field_accepts_links_only(self):
         self.publish_ok(self.payload(image=self.seeded[0]["url"]))
@@ -406,6 +438,185 @@ class AdsStackTests(unittest.TestCase):
         ad = publisher.publish(self.payload())
         self.assertEqual(ad.text, VALID_TEXT.upper())
         self.assertEqual(repository.get_ad(ad.id), ad)
+
+    def setup_update(self):
+        self.now = 1_900_000_000
+        self.repo = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
+        self.svc = self.service.AdsService(self.repo, clock=lambda: self.now)
+        self.ad = self.svc.publish_ad(self.payload())
+        self.auth = {"creator_id": 1, "access_token": self.token}
+
+    def owner_rows(self):
+        with closing(sqlite3.connect(self.publish.DB_PATH)) as conn:
+            return conn.execute("SELECT COUNT(*) FROM image_owners").fetchone()[0]
+
+    def video_ad(self):
+        video = self.svc.upload_video(self.video_payload())
+        return video, self.svc.publish_ad({**self.auth, "text": VALID_TEXT, "video_id": video.id})
+
+    def assert_update_error(self, ad_id, data, code, field):
+        with self.assertRaises(self.validation.ValidationError) as caught:
+            self.svc.update_ad(ad_id, data)
+        self.assertEqual((caught.exception.code, caught.exception.field), (code, field))
+
+    def test_update_ad_changes_text(self):
+        self.setup_update()
+        self.now += 50
+        ad = self.svc.update_ad(self.ad.id, {**self.auth, "text": "  Fresh new copy  "})
+        self.assertEqual(ad.text, "Fresh new copy")
+        self.assertEqual((ad.creation_time, ad.update_time), (self.ad.creation_time, self.now))
+        self.assertEqual(self.repo.get_ad(self.ad.id), ad)
+        self.now += 10
+        self.assertEqual(self.svc.update_ad(self.ad.id, {**self.auth, "text": "Again new"}).update_time,
+                         self.now)
+        for text in ("ab", NEW_URL, "a" * 32):
+            self.assert_update_error(self.ad.id, {**self.auth, "text": text}, "002", "text")
+        self.assertEqual(self.repo.get_ad(self.ad.id).update_time, self.now)  # Unchanged by rejects.
+
+    def test_update_body_shape(self):
+        self.setup_update()
+        # Checked before the account and the token.
+        cases = [({}, "002", "body"), ("not a dict", "002", "body"),
+                 ({"creator_id": 999, "access_token": "x"}, "002", "body"),
+                 ({**self.auth, "text": "Okay text", "colour": 1}, "001", "colour"),
+                 ({"creator_id": 999, "image": NEW_URL, "video_id": 1}, "002", "video_id"),
+                 ({"creator_id": 999, "image_hash": "a" * 32, "image": NEW_URL}, "002", "image_hash"),
+                 ({"creator_id": 999, "image_name": "x", "image_hash": "a" * 32}, "002", "image_name"),
+                 ({"text": "Okay text"}, "002", "creator_id"),
+                 ({"creator_id": 999, "text": "Okay text"}, "002", "creator_id"),
+                 ({"creator_id": 1, "access_token": "wrong", "text": "Okay text"}, "002",
+                  "access_token")]
+        for data, code, field in cases:
+            with self.subTest(data=data):
+                self.assert_update_error(self.ad.id, data, code, field)
+
+    def test_update_ad_keeps_type(self):
+        self.setup_update()
+        video, video_ad = self.video_ad()
+        self.assert_update_error(self.ad.id, {**self.auth, "video_id": video.id}, "002", "video_id")
+        self.assert_update_error(video_ad.id, {**self.auth, "image": NEW_URL}, "002", "image")
+        self.assert_update_error(video_ad.id, {**self.auth, "image_hash": "a" * 32}, "002",
+                                 "image_hash")
+        self.assert_update_error(self.ad.id, {**self.auth, "access_token": "bad",
+                                              "video_id": video.id}, "002", "access_token")
+        self.assertEqual(self.repo.get_ad(self.ad.id), self.ad)
+        self.assertEqual(self.repo.get_ad(video_ad.id), video_ad)
+
+    def test_update_ad_hides_other_ads(self):
+        self.setup_update()
+        token = self.create_account(2, "Advertiser Two")
+        other = self.svc.publish_ad({"creator_id": 2, "access_token": token, "text": VALID_TEXT,
+                                     "image": self.seeded[0]["url"]})
+        for ad_id in (other.id, 999, "abc"):
+            self.assert_update_error(ad_id, {**self.auth, "text": "Hijacked"}, "002", "ad_id")
+        self.assertEqual(self.repo.get_ad(other.id), other)
+
+    def test_update_ad_replaces_media(self):
+        self.setup_update()
+        owned = self.svc.upload_image({"owner_id": 1, "access_token": self.token,
+                                       "file": self.video_file("photo.png", b"PNG"),
+                                       "image_name": "Photo"})
+        self.assertNotEqual(owned, self.ad.image_hash)
+        self.assertEqual(self.svc.update_ad(self.ad.id, {**self.auth, "image_hash": owned}).image_hash,
+                         owned)
+        linked = self.svc.update_ad(self.ad.id, {**self.auth, "image": NEW_URL})
+        self.assertNotEqual(linked.image_hash, owned)
+        ad = self.svc.update_ad(self.ad.id, {**self.auth, "image_name": "Photo"})
+        self.assertEqual(ad.image_hash, owned)
+        # The seeded image has no owner, so it is rejected and the ad is unchanged.
+        for field, value in (("image_hash", self.seeded[1]["hash"]), ("image_name", "Nope")):
+            self.assert_update_error(self.ad.id, {**self.auth, field: value}, "002", field)
+        self.assertEqual(self.repo.get_ad(self.ad.id), ad)
+        video, video_ad = self.video_ad()
+        second = self.svc.upload_video(self.video_payload(name="Second", file=self.video_file(
+            "other.mp4", b"OTHER_VIDEO_BYTES")))
+        self.assertEqual(self.svc.update_ad(video_ad.id, {**self.auth, "video_id": second.id}).video_id,
+                         second.id)
+        other_token = self.create_account(2, "Advertiser Two")
+        foreign = self.svc.upload_video(self.video_payload(
+            owner_id=2, access_token=other_token, file=self.video_file("f.mp4", b"FOREIGN")))
+        for video_id in (foreign.id, 999):
+            self.assert_update_error(video_ad.id, {**self.auth, "video_id": video_id}, "002",
+                                     "video_id")
+        self.assertEqual(self.repo.get_ad(video_ad.id).video_id, second.id)
+
+    def test_update_checks_text_before_media(self):
+        self.setup_update()
+        # As in publishing, invalid text is reported before an unowned image.
+        for field, value in (("image_hash", self.seeded[1]["hash"]), ("image_name", "Nope")):
+            self.assert_update_error(self.ad.id, {**self.auth, "text": "ab", field: value},
+                                     "002", "text")
+        with self.assertRaises(self.validation.ValidationError) as caught:
+            self.svc.publish_ad({**self.auth, "text": "ab", "image_hash": self.seeded[1]["hash"]})
+        self.assertEqual(caught.exception.field, "text")
+
+    def test_link_image_owned_at_edit_time(self):
+        self.setup_update()
+        self.now += 100
+        ad = self.svc.update_ad(self.ad.id, {**self.auth, "image": NEW_URL})
+        self.assertEqual(self.repo.get_image(1, ad.image_hash).creation_time, self.now)
+        rows = self.owner_rows()
+        with self.assertRaises(self.validation.ValidationError):
+            self.svc.update_ad(self.ad.id, {**self.auth, "text": "x", "image": NEW_URL + "?2"})
+        self.assertEqual(self.owner_rows(), rows)
+
+    def test_update_runs_rules_on_merged_draft(self):
+        self.setup_update()
+        seen = []
+
+        def rule(draft):
+            seen.append(draft)
+            if "forbidden" in draft.text:
+                raise self.validation.ValidationError("002", "text")
+
+        validator = self.validation.AdValidator(self.repo, rules=[rule])
+        storage = Mock(wraps=self.image_store)
+        svc = self.service.AdsService(
+            self.repo, clock=lambda: self.now,
+            publisher=self.publishing.AdPublisher(self.repo, validator=validator,
+                                                  image_storage=storage, clock=lambda: self.now))
+        svc.update_ad(self.ad.id, {**self.auth, "text": "Allowed copy"})
+        self.assertEqual(seen[-1], self.models.AdDraft(1, "Allowed copy", None, self.ad.image_hash,
+                                                       None, None, ad_id=self.ad.id))
+        # A rejected link edit stores nothing and ingests nothing.
+        stored, rows = self.repo.get_ad(self.ad.id), self.owner_rows()
+        with self.assertRaises(self.validation.ValidationError):
+            svc.update_ad(self.ad.id, {**self.auth, "text": "forbidden copy", "image": NEW_URL})
+        self.assertEqual((self.repo.get_ad(self.ad.id), self.owner_rows()), (stored, rows))
+        storage.store_image.assert_not_called()
+
+    def test_update_uses_publisher_hooks(self):
+        from dataclasses import replace
+        self.setup_update()
+
+        linked = []
+
+        class UppercasePublisher(self.publishing.AdPublisher):
+            def normalize_image(self, draft):
+                if draft.image is None:
+                    return draft
+                linked.append(draft.image)
+                return replace(draft, image=None, image_hash="e" * 32)
+
+            def persist(self, draft):
+                return super().persist(replace(draft, text=draft.text.upper()))
+
+        svc = self.service.AdsService(self.repo, publisher=UppercasePublisher(
+            self.repo, clock=lambda: self.now))
+        ad = svc.update_ad(self.ad.id, {**self.auth, "text": "Edited copy"})
+        self.assertEqual(ad.text, "EDITED COPY")
+        self.assertEqual(self.repo.get_ad(self.ad.id), ad)
+        rows = self.owner_rows()
+        ad = svc.update_ad(self.ad.id, {**self.auth, "image": NEW_URL})
+        self.assertEqual((linked, ad.image_hash), ([NEW_URL], "e" * 32))
+        self.assertEqual(self.owner_rows(), rows)  # The override replaced ingestion.
+        self.assertEqual(self.repo.get_ad(self.ad.id), ad)
+
+    def test_text_edit_on_legacy_ad(self):
+        self.setup_update()
+        legacy = self.repo.save_ad(self.models.AdDraft(1, VALID_TEXT, image_hash="d" * 32), 10)
+        ad = self.svc.update_ad(legacy.id, {**self.auth, "text": "Edited legacy"})
+        self.assertEqual((ad.text, ad.image_hash), ("Edited legacy", "d" * 32))
 
     def test_image_ingestion_failure_does_not_publish(self):
         repository = self.repository.SQLiteAdsRepository(self.publish.DB_PATH)
@@ -1096,7 +1307,8 @@ class AdsStackTests(unittest.TestCase):
         self.assertLessEqual(before, ad["creation_time"])
         self.assertEqual(ad, {"id": ad_id, "system_name": f"ad_{ad_id}", "image_hash": None,
                               "text": VALID_TEXT, "creator_id": 1,
-                              "creation_time": ad["creation_time"], "video_id": video_id})
+                              "creation_time": ad["creation_time"], "video_id": video_id,
+                              "update_time": None})
         self.assertEqual(self.publish.get_ads(ad_id, ["video_id"]), {"video_id": video_id})
         fresh = self.fresh_process(f"import json, publish; print(json.dumps(publish.get_ad({ad_id})))")
         self.assertEqual(fresh, ad)

@@ -24,6 +24,8 @@ class AdDraft:
     video_id: Optional[int] = None
     # Set once by the publisher so every stage records the same time.
     creation_time: Optional[int] = None
+    # Set when editing an existing ad.
+    ad_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,8 @@ class Ad:
     creator_id: int
     creation_time: int
     video_id: Optional[int] = None
+    # None until the ad is first edited.
+    update_time: Optional[int] = None
 
     def to_dict(self):
         return asdict(self)

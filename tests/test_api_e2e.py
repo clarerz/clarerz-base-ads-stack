@@ -37,7 +37,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II"
 MP4 = b"\x00\x00\x00\x18ftypmp42" + bytes(range(64))
 SEEDED_URL = jsonlib.loads((BASE_DIR / "images.json").read_text())[0]["url"]
 ROUTES = {"/accounts", "/accounts/{account_id}", "/accounts/{account_id}/ads",
-          "/accounts/{account_id}/images", "/accounts/{account_id}/videos", "/ads/{ad_id}",
+          "/accounts/{account_id}/ads/{ad_id}", "/accounts/{account_id}/images", "/accounts/{account_id}/videos", "/ads/{ad_id}",
           "/videos/{video_id}", "/accounts/{account_id}/images/lookup",
           "/accounts/{account_id}/media/{kind}/{media_hash}",
           "/accounts/{account_id}/ads/{ad_id}/previews",

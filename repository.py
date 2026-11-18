@@ -24,6 +24,7 @@ class AdsRepository(Protocol):
                     since: Optional[int] = None, until: Optional[int] = None) -> list: ...
     def save_ad(self, draft: AdDraft, creation_time: int) -> Ad: ...
     def get_ad(self, ad_id: int) -> Optional[Ad]: ...
+    def update_ad(self, draft: AdDraft, update_time: int) -> Optional[Ad]: ...
     def list_ads(self, creator_id: int, limit: int, after: Optional[tuple] = None,
                  since: Optional[int] = None, until: Optional[int] = None) -> list: ...
     def save_video(self, owner_id: int, name: str, video_hash: str, upload_time: int) -> Video: ...
@@ -43,7 +44,7 @@ class AdsRepository(Protocol):
                         token_hash: Optional[str] = None) -> None: ...
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class SQLiteAdsRepository:
@@ -71,6 +72,8 @@ class SQLiteAdsRepository:
                     self._create_v2(conn)
                 if version < 3:
                     self._create_v3(conn)
+                if version < 4:
+                    self._create_v4(conn)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 conn.execute("COMMIT")
             except BaseException:
@@ -126,6 +129,9 @@ class SQLiteAdsRepository:
         conn.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, "
                      "account_id INTEGER NOT NULL, expires_at INTEGER NOT NULL)")
         conn.execute("CREATE INDEX IF NOT EXISTS sessions_by_account ON sessions (account_id)")
+
+    def _create_v4(self, conn):
+        self._add_column(conn, "ads", "update_time INTEGER")
 
     @staticmethod
     def _add_column(conn, table, column):
@@ -219,7 +225,7 @@ class SQLiteAdsRepository:
                     draft.creator_id, creation_time, draft.video_id)
             conn.execute(
                 "INSERT INTO ads (id, system_name, image_hash, text_content, creator_id, "
-                "creation_time, video_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "creation_time, video_id, update_time) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
                 (ad.id, ad.system_name, ad.image_hash, ad.text, ad.creator_id,
                  ad.creation_time, ad.video_id),
             )
@@ -227,16 +233,31 @@ class SQLiteAdsRepository:
 
     def get_ad(self, ad_id):
         with closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT id, system_name, image_hash, text_content, creator_id, creation_time, "
-                "video_id FROM ads WHERE id = ?", (ad_id,),
-            ).fetchone()
+            return self._select_ad(conn, ad_id)
+
+    def update_ad(self, draft, update_time):
+        """Replace the ad's content; return it, or None if the creator has no such ad."""
+        with closing(self._connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE ads SET text_content = ?, image_hash = ?, video_id = ?, update_time = ? "
+                "WHERE id = ? AND creator_id = ?",
+                (draft.text, draft.image_hash, draft.video_id, update_time, draft.ad_id,
+                 draft.creator_id),
+            )
+            return self._select_ad(conn, draft.ad_id) if cursor.rowcount == 1 else None
+
+    @staticmethod
+    def _select_ad(conn, ad_id):
+        row = conn.execute(
+            "SELECT id, system_name, image_hash, text_content, creator_id, creation_time, "
+            "video_id, update_time FROM ads WHERE id = ?", (ad_id,),
+        ).fetchone()
         return Ad(*row) if row is not None else None
 
     def list_ads(self, creator_id, limit, after=None, since=None, until=None):
         """Newest first; `after` is the (creation_time, id) of the previous page's last ad."""
         rows = self._list_page("SELECT id, system_name, image_hash, text_content, creator_id, "
-                               "creation_time, video_id FROM ads",
+                               "creation_time, video_id, update_time FROM ads",
                                creator_id, limit, after, since, until, owner_column="creator_id",
                                time_column="creation_time", key_column="id")
         return [Ad(*row) for row in rows]

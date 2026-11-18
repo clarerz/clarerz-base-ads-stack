@@ -221,6 +221,16 @@ def publish_ad(account_id: str, body: dict = Body(...), token=Depends(bearer_tok
     return {"id": ad.id}
 
 
+@router.patch("/accounts/{account_id}/ads/{ad_id}")
+def update_ad(account_id: str, ad_id: str, body: dict = Body(...), token=Depends(bearer_token),
+              service=Depends(get_service)):
+    # Like publishing, the creator and token come from the path and header, never the body.
+    data = check_fields(body, AdValidator.update_fields)
+    ad = call("ad", service.update_ad, ad_id,
+              {**data, "creator_id": account_id, "access_token": token}, not_found=("ad_id",))
+    return ad.to_dict()
+
+
 @router.get("/accounts/{account_id}/ads")
 def list_ads(account_id: str, page=Depends(page_params), service=Depends(get_service)):
     ads, next_cursor = call("ad", service.list_ads, account_id, *page)
@@ -540,6 +550,19 @@ def _stored_media_src(request, access, kind, owner_id, media_hash):
     return media_url(request, token_hash, kind, owner_id, media_hash, expires)
 
 
+def _ad_media(request, service, ad, owner_id, access):
+    """Return ("image" or "video", a URL a browser can show or None) for the ad's media."""
+    if ad.video_id is not None:
+        video = service.repository.get_video(ad.video_id)
+        kind, src = "video", video and _stored_media_src(request, access, "videos",
+                                                         owner_id, video.video_hash)
+    else:
+        image, owned = _ad_image(service, ad)
+        kind, src = "image", image.image_url or (owned and _stored_media_src(
+            request, access, "images", owner_id, image.hash))
+    return kind, src or None
+
+
 def preview_page(request, owner_id, ad_id, ad_format, access):
     """Return the HTML preview of the account's ad in ad_format, or None if there is none.
 
@@ -551,15 +574,8 @@ def preview_page(request, owner_id, ad_id, ad_format, access):
     if ad is None or ad_format not in previews.FORMATS:
         return None
     account = service.repository.get_account(owner_id)
-    if ad.video_id is not None:
-        video = service.repository.get_video(ad.video_id)
-        kind, src = "video", video and _stored_media_src(request, access, "videos",
-                                                         owner_id, video.video_hash)
-    else:
-        image, owned = _ad_image(service, ad)
-        kind, src = "image", image.image_url or (owned and _stored_media_src(
-            request, access, "images", owner_id, image.hash))
-    return previews.render(ad_format, account.name, ad.text, kind, src or None)
+    kind, src = _ad_media(request, service, ad, owner_id, access)
+    return previews.render(ad_format, account.name, ad.text, kind, src)
 
 
 @router.get("/accounts/{account_id}/ads/{ad_id}/previews")
@@ -582,8 +598,12 @@ def list_ad_previews(account_id: str, ad_id: str, request: Request,
          "preview_url": signed_url(request, token_hash, owner_id, f"preview:{name}", ad.id,
                                    "get_ad_preview", ad_id=ad.id, ad_format=name),
          "width": spec["width"], "height": spec["height"],
+         "text": previews.shown_text(name, ad.text),
          "warnings": previews.warnings(name, ad.text, width, height)}
         for name, spec in previews.FORMATS.items() if ad_format in (None, name)],
+        "media": dict(zip(("kind", "url"), call(
+            "image", _ad_media, request, service, ad, owner_id,
+            (int(service.clock()) + PREVIEW_SECONDS, token_hash)))),
         "share_url": share_url, "share_expires": share_expires if share_url else None}
 
 
@@ -608,7 +628,7 @@ def share_page(request, owner_id, ad_id, access):
                 "warnings": previews.warnings(name, ad.text, width, height)}
                for name, spec in previews.FORMATS.items()]
     account = service.repository.get_account(owner_id)
-    return previews.render_share(account.name, ad.id, expires, entries)
+    return previews.render_share(account.name, ad.id, expires, entries, ad.update_time)
 
 
 @router.get("/accounts/{account_id}/ads/{ad_id}/share", name="get_ad_share")
@@ -663,11 +683,13 @@ def get_ad_preview(account_id: str, ad_id: str, ad_format: str, request: Request
 
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
-UI_ASSETS = {"app.js": "text/javascript", "app.css": "text/css"}
+UI_ASSETS = {"app.js": "text/javascript", "app.css": "text/css",
+             "preview.css": "text/css"}
 UI_HEADERS = {
     # Scripts and styles come only from the files below; API calls only to this server.
+    # Media comes from this server (signed URLs) or, for link images, the advertiser's link.
     "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; "
-                               "connect-src 'self'; img-src 'self'; frame-src 'self'; "
+                               "connect-src 'self'; img-src 'self' http: https:; media-src 'self'; "
                                "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",

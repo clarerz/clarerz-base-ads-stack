@@ -145,6 +145,9 @@ class AdsService:
     def publish_ad(self, data):
         return self.publisher.publish(data)
 
+    def update_ad(self, ad_id, data):
+        return self.publisher.update(ad_id, data)
+
     def get_ad(self, ad_id):
         ad_id = coerce_id(ad_id)
         return None if ad_id is None else self.repository.get_ad(ad_id)

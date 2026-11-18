@@ -93,6 +93,7 @@ use the same `{"error_code", "error_message"}` body.
 | `GET` | `/accounts/{account_id}` | None | 200 `{"id", "name"}` |
 | `PATCH` | `/accounts/{account_id}` (`{"name"}`) | Account token | 200 `{"id", "name"}` |
 | `POST` | `/accounts/{account_id}/ads` (`text` plus one image field or `video_id`) | Account token | 201 `{"id"}` |
+| `PATCH` | `/accounts/{account_id}/ads/{ad_id}` (`text`, and `video_id` or one image field) | Account token | 200 ad |
 | `GET` | `/accounts/{account_id}/ads?limit&cursor&since&until` | None | 200 `{"data", "next_cursor"}` |
 | `GET` | `/ads/{ad_id}?fields=text,image_hash` | None | 200 ad or projected fields |
 | `POST` | `/accounts/{account_id}/images?filename=&image_name=` (raw bytes) | Account token | 201 `{"hash"}` |
@@ -103,7 +104,7 @@ use the same `{"error_code", "error_message"}` body.
 | `GET` | `/videos/{video_id}` | Account token | 200 video |
 | `PATCH` | `/videos/{video_id}` (`{"name"}`) | Account token | 200 video |
 | `GET` | `/accounts/{account_id}/media/{images\|videos}/{hash}?exp&sig` | Account token or signed URL | 200 file bytes |
-| `GET` | `/accounts/{account_id}/ads/{ad_id}/previews?ad_format=` | Account token | 200 `{"data": [{"format", "preview_url", "width", "height", "warnings"}], "share_url", "share_expires"}` |
+| `GET` | `/accounts/{account_id}/ads/{ad_id}/previews?ad_format=` | Account token | 200 `{"data": [{"format", "preview_url", "width", "height", "text", "warnings"}], "media": {"kind", "url"}, "share_url", "share_expires"}` |
 | `GET` | `/accounts/{account_id}/ads/{ad_id}/previews/{feed\|story\|banner}?exp&sig` | Account token or signed URL | 200 HTML page |
 | `GET` | `/accounts/{account_id}/ads/{ad_id}/share?exp&sig` | Account token or signed URL | 200 HTML page with all three placements |
 | `POST` | `/accounts/{account_id}/users` (`{"username", "password"}`) | Account token, `X-Ads-UI: 1` | 201 `{"username", "account_id"}` |
@@ -159,6 +160,10 @@ renders in each format. It returns data, not markup: each entry's `preview_url` 
 signed link to a static HTML page, and a client embeds it with
 `<iframe src="{preview_url}" width="{width}" height="{height}" title="Ad preview">`.
 `?ad_format=` returns one format. Nothing is rendered until the page is fetched.
+Each entry's `text` is the text as that format displays it (cut like the page, not
+HTML-escaped), and the top-level `media` is `{"kind": "image" | "video", "url"}`: a link
+image's source link, or a signed URL valid as long as the `preview_url`s, and `null` when
+the bytes cannot be shown or there is no `ADS_MEDIA_KEY`.
 
 | Format | Page (CSS px) | Media frame | Text |
 | --- | --- | --- | --- |
@@ -166,8 +171,8 @@ signed link to a static HTML page, and a client embeds it with
 | `story` | 360×640 | Full page (9:16); text over a gradient, clear of the top and bottom safe zones | Cut at 125 characters |
 | `banner` | 600×354 | 600×314 (1.91:1), above one line of text | Cut at 40 characters |
 
-Media fills its frame and is cropped to fit. Videos play muted; the story autoplays and
-loops, and the others show the first frame with controls. `warnings` lists
+Media fills its frame and is cropped to fit. Videos play muted and have controls; the
+story also autoplays and loops, and the others show the first frame. `warnings` lists
 `text_truncated` when the ad's text is cut and `media_cropped` when the image's known
 size is more than 1% away from the frame's aspect ratio; video sizes are unknown, so
 videos never report it.
@@ -207,11 +212,13 @@ embeds expire with it. The link is signed like a preview URL, so reissuing the a
 access token or changing `ADS_MEDIA_KEY` revokes it. Every invalid link (missing, expired,
 altered, revoked, or for an ad the account does not own) gets the same HTML 404, "This
 preview link is invalid or has expired.", so a link reveals nothing about why it failed.
-A bearer token is also accepted on the route; the embedded URLs then last 10 minutes. The
-page is served with `Content-Security-Policy: sandbox; default-src 'none'; frame-src
-<this server>; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'`,
-`Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, and `Cache-Control:
-no-store`. Share links are stateless, so one link cannot be revoked on its own.
+A bearer token is also accepted on the route; the embedded URLs then last 10 minutes. On
+an edited ad's page, "Last edited YYYY-MM-DD HH:MM UTC" appears under the heading, before
+"Link expires". The page is served with `Content-Security-Policy: sandbox; default-src
+'none'; frame-src <this server>; style-src 'unsafe-inline'; base-uri 'none'; form-action
+'none'`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, and
+`Cache-Control: no-store`. Share links are stateless, so one link cannot be revoked on
+its own.
 
 The image lookup takes exactly one of `image_hash` or `image_name` and follows
 `get_image` in the Python API; a missing image, another account's image, and a
@@ -237,10 +244,20 @@ JSON bodies are limited to 64 KiB (`api.MAX_JSON_BYTES`) and must declare a
 for `body`, before authentication runs, so the server never buffers an
 unauthenticated body of unbounded size.
 
-The account in the path stands in for `creator_id` when publishing, so a body
-that names `creator_id` or `access_token` returns `001`. An unknown account in an
+The account in the path stands in for `creator_id` when publishing or editing, so
+a body that names `creator_id` or `access_token` returns `001`. An unknown account in an
 ad route is reported as `002` for `creator_id`, and in an upload or listing route
 as `002` for `owner_id`.
+
+`PATCH` on an ad changes only the fields sent: `text`, `video_id` (a video ad), or
+one of `image`, `image_hash`, `image_name` (an image ad). An ad keeps its type, so
+an image field on a video ad, or `video_id` on an image ad, returns `002` for that
+field. Errors come in this order: body shape (`002` for `body` when empty or not an
+object, `001` for an unknown field, `002` for `video_id` or a second image field
+when sent together), then the account (`002` for `creator_id`), then the token
+(401), then the ad. A missing ad, another account's ad, and a non-numeric `ad_id`
+all return the same 404 with `002` for `ad_id`. The edit returns 200 with the ad,
+whose `update_time` is the edit's Unix time.
 
 Uploads send the file's bytes as the request body with a `Content-Length`
 header. `filename` supplies only the extension (the same extensions as the
@@ -292,15 +309,28 @@ selected as an ad's media, or an image link entered instead. The account's ads a
 listed newest first, 10 per page. Upload progress, duplicate uploads (409), and API
 errors are shown next to the relevant field; a 401 returns to sign-in. Pages are served
 with a CSP that allows only this server's script, style, and connections, and server
-values are inserted as text only. The CSP also allows frames from this server
-(`frame-src 'self'`) for ad previews.
+values are inserted as text only. The exact policy is `default-src 'none'; script-src 'self';
+style-src 'self'; connect-src 'self'; img-src 'self' http: https:; media-src 'self';
+form-action 'self'; frame-ancestors 'none'; base-uri 'none'`.
 
-**Previews.** Each ad row has a Preview button. It opens a dialog with the feed, story,
-and banner placements in frames, each with its warnings ("Text is cut off", "Image is
+**Previews.** Each ad row has a Preview button. It opens a dialog that draws the feed,
+story, and banner placements directly (no frames, using `/ui/preview.css`, the same
+stylesheet as the preview pages), each with its warnings ("Text is cut off", "Image is
 cropped to fit"). Below them are the ad's share link, its expiry, and a Copy link button
 (if the browser blocks copying, the link text is selected instead). Anyone with the link
 can see the ad for 7 days, and signing out does not revoke it; see Share links above.
-Without `ADS_MEDIA_KEY`, the dialog says previews are unavailable.
+Without `ADS_MEDIA_KEY`, the placements show their text and "Media unavailable" for
+media, and stay editable.
+
+**Editing in the preview.** Ad text is outlined on hover or focus; click it, or focus it
+and press Enter or Space, to edit. Blur or closing the dialog saves with
+`PATCH /accounts/{id}/ads/{ad_id}`; Escape cancels, and unchanged text sends nothing. Text
+the API rejects stays open with the error shown. To replace an image, click it (or its
+"Replace image" overlay) and pick a file; a video has a separate "Replace video" button
+in its top-right corner, so play and pause stay native. An upload the account already
+has (409) reuses the existing asset, and a new upload appears unselected in the media
+list. One edit runs at a time. Failures that outlive the dialog show in the status
+line as "Ad #N: text not saved: ...". A 401 returns to sign-in.
 
 Known limits: the throttle is per login, so anyone who knows an account ID (they are
 public) can keep its login failing with one bad attempt every 30 seconds; add per-IP
@@ -309,7 +339,8 @@ limits before using this beyond demos. At most 4 scrypt checks run at once per p
 ## Objects and fields
 
 An ad contains `id`, `system_name` (`ad_<id>`), `image_hash`, `text`,
-`creator_id`, `creation_time` (Unix seconds), and `video_id`. IDs (accounts,
+`creator_id`, `creation_time` (Unix seconds), `update_time` (Unix seconds of the last edit, `None`
+until the first), and `video_id`. IDs (accounts,
 ads, videos) are integers from 0 to 2^63 − 1, given as ints or digit strings;
 anything else is invalid (`002`) for writes and missing (`None`) for reads,
 including any account created with a negative ID by an earlier build. Image ads
@@ -481,10 +512,17 @@ timestamp. Its default validator checks hashes against that same storage; pass
 the same `image_storage` to a custom `AdValidator`. Subclass it to customize
 `normalize_image(draft)` or `persist(draft)`, or supply another publisher with
 `publish(data) -> Ad` to `AdsService`.
+
 `AdsService(repository, image_storage=..., clock=...)` stores and timestamps
 uploads with those and builds its default publisher on them; a publisher you supply should use the same
 storage. A different repository must implement the `AdsRepository` protocol in
 `repository.py` using the same domain objects.
+
+Edits go through `AdsService.update_ad(ad_id, data)`. A custom repository must
+implement `update_ad(draft, update_time)`. Duck-typed validators need
+`validate_update(ad_id, data)` and custom publishers need `update(ad_id, data)`;
+without them, edits fail with `003`. An override of `AdValidator.validate` does not
+run on edits. Rules see the draft with `ad_id` set and `creation_time=None`.
 
 ## Storage
 

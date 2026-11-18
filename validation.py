@@ -152,6 +152,7 @@ class AdValidator:
     # An image ad names its image exactly one way: by link, hash, or the account's name.
     image_fields = ("image", "image_hash", "image_name")
     allowed_fields = frozenset({"creator_id", "access_token", "text", "video_id", *image_fields})
+    update_fields = frozenset({"text", "video_id", *image_fields})
 
     def __init__(self, repository, rules=(), image_storage=None):
         self.repository = repository
@@ -171,6 +172,18 @@ class AdValidator:
         image_fields = [field for field in self.image_fields if field in data]
         if not image_fields and "video_id" not in data:
             raise ValidationError("002", "image")
+        creator_id = self._authenticated_creator(data, image_fields)
+        text = self.validate_text(data["text"])
+        image, image_hash = self._resolve_image(data, creator_id)
+        video_id = (self.validate_video(data["video_id"], creator_id)
+                    if "video_id" in data else None)
+        draft = AdDraft(creator_id, text, image, image_hash, video_id)
+        for rule in self.rules:
+            rule(draft)
+        return draft
+
+    def _authenticated_creator(self, data, image_fields):
+        """Return the authenticated creator_id after the checks shared by publish and edit."""
         if image_fields and "video_id" in data:
             # An ad is either an image ad or a video ad.
             raise ValidationError("002", "video_id")
@@ -181,19 +194,57 @@ class AdValidator:
         creator_id = self.validate_creator(data["creator_id"])
         # Authenticate before ownership checks so they reveal nothing to other callers.
         authenticate(self.repository, creator_id, data.get("access_token"))
-        text = self.validate_text(data["text"])
+        return creator_id
+
+    def _resolve_image(self, data, creator_id):
+        """Return (link, image_hash) for the image field sent, (None, None) if none."""
         image = self.validate_image(data["image"]) if "image" in data else None
         image_hash = None
         if "image_hash" in data:
             image_hash = self.validate_hash(data["image_hash"], creator_id)
         elif "image_name" in data:
             image_hash = self.validate_image_name(data["image_name"], creator_id)
-        video_id = (self.validate_video(data["video_id"], creator_id)
-                    if "video_id" in data else None)
-        draft = AdDraft(creator_id, text, image, image_hash, video_id)
+        return image, image_hash
+
+    def validate_update(self, ad_id, data):
+        """Return the draft of the stored ad with the fields sent in data applied."""
+        if not isinstance(data, dict):
+            raise ValidationError("002", "body")
+        for field in data:
+            if field not in self.allowed_fields:
+                raise ValidationError("001", field)
+        if not self.update_fields.intersection(data):
+            raise ValidationError("002", "body")
+        image_fields = [field for field in self.image_fields if field in data]
+        creator_id = self._authenticated_creator(data, image_fields)
+        ad = self._owned_ad(ad_id, creator_id)
+        # An ad keeps its type: image ads take image fields and video ads take video_id.
+        if ad.video_id is not None and image_fields:
+            raise ValidationError("002", image_fields[0])
+        if ad.video_id is None and "video_id" in data:
+            raise ValidationError("002", "video_id")
+        # Text before media, as in validate.
+        text = self.validate_text(data["text"]) if "text" in data else ad.text
+        image, image_hash = (self._resolve_image(data, creator_id) if image_fields
+                             else (None, ad.image_hash))
+        draft = AdDraft(
+            creator_id, text, image, image_hash,
+            self.validate_video(data["video_id"], creator_id) if "video_id" in data
+            else ad.video_id, ad_id=ad.id)
         for rule in self.rules:
             rule(draft)
         return draft
+
+    def _owned_ad(self, ad_id, creator_id):
+        # Missing, invalid, and other accounts' ads get the same error.
+        ad_id = coerce_id(ad_id)
+        try:
+            ad = None if ad_id is None else self.repository.get_ad(ad_id)
+        except Exception as exc:
+            raise StorageError("ad_id") from exc
+        if ad is None or ad.creator_id != creator_id:
+            raise ValidationError("002", "ad_id")
+        return ad
 
     def validate_creator(self, value):
         return existing_account_id(self.repository, value, "creator_id")

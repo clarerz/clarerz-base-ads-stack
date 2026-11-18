@@ -49,6 +49,13 @@ class AdPublisher:
         draft = self.normalize_image(draft)
         return self.persist(draft)
 
+    def update(self, ad_id, data):
+        draft = self.validator.validate_update(ad_id, data)
+        # The edit time stamps any ingested link image, so it is not backdated.
+        draft = replace(draft, creation_time=int(self.clock()))
+        draft = self.normalize_image(draft)
+        return self.persist(draft)
+
     def _time_for(self, draft):
         # Stages called directly, without publish(), read the clock themselves.
         return draft.creation_time if draft.creation_time is not None else int(self.clock())
@@ -61,4 +68,9 @@ class AdPublisher:
         return replace(draft, image=None, image_hash=image_hash)
 
     def persist(self, draft):
+        if draft.ad_id is not None:
+            ad = self.repository.update_ad(draft, self._time_for(draft))
+            if ad is None:
+                raise ValidationError("002", "ad_id")
+            return ad
         return self.repository.save_ad(draft, self._time_for(draft))

@@ -1,6 +1,7 @@
 """Ad preview formats rendered as static HTML pages; no storage or HTTP here."""
 
 from html import escape
+from pathlib import Path
 import time
 
 # Page and media sizes in CSS pixels. Each media frame has its format's aspect ratio:
@@ -10,6 +11,7 @@ FORMATS = {
     "story": {"width": 360, "height": 640, "media": (360, 640), "text_limit": 125},
     "banner": {"width": 600, "height": 354, "media": (600, 314), "text_limit": 40},
 }
+PREVIEW_CSS = (Path(__file__).parent / "web" / "preview.css").read_text()
 # Media whose aspect ratio is off by more than this fraction is reported as cropped.
 CROP_TOLERANCE = 0.01
 
@@ -33,11 +35,17 @@ SHARE_NOT_FOUND = """<!DOCTYPE html>
 """
 
 
+def shown_text(ad_format, text):
+    """Return the text as the format displays it, cut at its limit, before HTML escaping."""
+    limit = FORMATS[ad_format]["text_limit"]
+    return text[:limit].rstrip() + "…" if len(text) > limit else text
+
+
 def render(ad_format, account_name, text, media_kind, media_src):
     """Return the preview page. media_kind is "image" or "video"; no media_src shows an empty box."""
     spec = FORMATS[ad_format]
     truncated = len(text) > spec["text_limit"]
-    shown = escape(text[:spec["text_limit"]].rstrip() + "…" if truncated else text)
+    shown = escape(shown_text(ad_format, text))
     header = f"<header><strong>{escape(account_name)}</strong> · Sponsored</header>"
     media = _media(media_kind, media_src, autoplay=ad_format == "story")
     if ad_format == "feed":
@@ -47,35 +55,20 @@ def render(ad_format, account_name, text, media_kind, media_src):
         body = f'{media}{header}<p class="text">{shown}</p>'
     else:
         body = f'{media}<p class="text">{shown}</p>'
-    media_width, media_height = spec["media"]
     return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Ad preview</title><style>
-*{{box-sizing:border-box}}
-body{{margin:0;width:{spec["width"]}px;height:{spec["height"]}px;overflow:hidden;
-font:14px/1.4 system-ui,sans-serif;color:#1c1e21;background:#fff}}
-.ad{{position:relative;width:100%;height:100%}}
-.media{{display:block;width:{media_width}px;height:{media_height}px;object-fit:cover;
-background:#e4e6eb;color:#65676b}}
-.empty{{display:flex;align-items:center;justify-content:center}}
-header{{height:44px;padding:12px 16px}}
-.text{{margin:0;overflow:hidden}}
-.feed .text{{height:96px;padding:0 16px 12px}}
-.more{{color:#65676b;font-weight:600}}
-.story .media{{position:absolute;inset:0}}
-.story header{{position:absolute;top:0;width:100%;color:#fff;text-shadow:0 1px 2px #000}}
-.story .text{{position:absolute;bottom:0;width:100%;padding:48px 16px 128px;color:#fff;
-background:linear-gradient(transparent,rgba(0,0,0,.7))}}
-.banner .text{{height:40px;padding:0 12px;line-height:40px;white-space:nowrap;
-text-overflow:ellipsis}}
-</style></head>
+<html lang="en"><head><meta charset="utf-8"><title>Ad preview</title><style>body{{margin:0;overflow:hidden;font:14px/1.4 system-ui,sans-serif;color:#1c1e21;background:#fff}}{PREVIEW_CSS}</style></head>
 <body><article class="ad {ad_format}">{body}</article></body></html>
 """
 
 
-def render_share(account_name, ad_id, expires, entries):
+def render_share(account_name, ad_id, expires, entries, update_time=None):
     """Return the page framing every placement. Each entry has format, url, width, height and
     warnings; the page runs no script."""
     until = time.strftime("%Y-%m-%d %H:%M", time.gmtime(expires))
+    edited = ""
+    if update_time is not None:
+        edited = (f'<p class="expires">Last edited '
+                  f'{time.strftime("%Y-%m-%d %H:%M", time.gmtime(update_time))} UTC</p>')
     figures = "".join(
         f'<figure><figcaption>{escape(entry["format"].capitalize())}</figcaption>'
         f'<iframe src="{escape(entry["url"])}" width="{entry["width"]}" height="{entry["height"]}" '
@@ -95,7 +88,7 @@ iframe{{display:block;max-width:100%;border:1px solid #ccd0d5;background:#fff}}
 figure p{{margin:4px 0 0;color:#65676b}}
 </style></head>
 <body><h1>Ad preview · {escape(account_name)} · Ad #{ad_id}</h1>
-<p class="expires">Link expires {until} UTC</p>
+{edited}<p class="expires">Link expires {until} UTC</p>
 <div class="frames">{figures}</div></body></html>
 """
 
@@ -108,5 +101,5 @@ def _media(kind, src, autoplay):
     if kind == "image":
         return f'<img class="media" src="{src}" alt="Ad image">'
     # No scripts run in the page, so playback is set by attributes alone.
-    playback = "autoplay muted loop playsinline" if autoplay else "controls muted playsinline"
+    playback = "controls autoplay muted loop playsinline" if autoplay else "controls muted playsinline"
     return f'<video class="media" src="{src}" {playback} preload="metadata" aria-label="Ad video"></video>'

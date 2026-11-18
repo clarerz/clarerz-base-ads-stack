@@ -39,7 +39,7 @@ Requester decisions:
 - Ad previews and media thumbnails *(author's call: thumbnails are a form of preview)* (Ad previews superseded on 2026-11-16; see README "Ad previews" and "Web UI". Thumbnails remain out of scope.)
 - Creating ad accounts from the UI (still admin key + `POST /accounts`).
 - Password reset or change, email, MFA, several users per account, roles.
-- Editing or deleting ads; renaming media.
+- Editing or deleting ads; renaming media (Editing ads superseded on 2026-11-17 by `2026-11-17-ads-preview-editing-design.md`; deleting and renaming media remain out of scope.)
 - A frontend build pipeline or JavaScript framework.
 - Per-IP login rate limiting (internal demos; see Known limits).
 

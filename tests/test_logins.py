@@ -34,7 +34,7 @@ class LoginRepositoryTests(unittest.TestCase):
             conn.execute("PRAGMA user_version = 2")
         self.repository.SQLiteAdsRepository(path)
         with closing(sqlite3.connect(path)) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
             tables = {row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
         self.assertLessEqual({"users", "sessions"}, tables)

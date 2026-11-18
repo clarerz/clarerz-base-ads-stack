@@ -225,6 +225,30 @@ class CookieAuthTests(ApiLoginCase):
         account = self.client.patch("/accounts/42", json={"name": "Acme Two"}, headers=UI)
         self.assertEqual(account.json(), {"id": 42, "name": "Acme Two"})
 
+    def test_patch_with_session_cookie(self):
+        ad = self.client.post("/accounts/42/ads", json={"text": "Fresh picks this week",
+                                                       "image": "https://x.example/a.png"},
+                              headers=UI)
+        self.assertEqual(ad.status_code, 201, ad.text)
+        response = self.client.patch("/accounts/42/ads/1", json={"text": "Fresher picks"},
+                                     headers=UI)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["text"], "Fresher picks")
+        self.assertEqual(response.json()["update_time"], self.now)
+        # The cookie opens only its own account's ads: another account's path or ad.
+        self.assertEqual(self.client.post("/accounts/7/ads", json={
+            "text": "Other account ad", "image": "https://x.example/b.png"},
+            headers={"Authorization": f"Bearer {self.other}"}).status_code, 201)
+        response = self.client.patch("/accounts/42/ads/2", json={"text": "Hijacked copy"},
+                                     headers=UI)
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertEqual(response.json()["error_code"], "002")
+        self.assertIn("ad_id", response.json()["error_message"])
+        response = self.client.patch("/accounts/7/ads/2", json={"text": "Hijacked copy"},
+                                     headers=UI)
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertEqual(self.client.get("/ads/2").json()["text"], "Other account ad")
+
     def test_sessions_get_verifiable_signed_urls(self):
         image = self.upload("images", PNG, filename="a.png", image_name="Hero").json()["hash"]
         video = self.upload("videos", MP4, filename="v.mp4", name="Clip").json()["id"]
@@ -318,14 +342,15 @@ class CookieAuthTests(ApiLoginCase):
 class UiRouteTests(ApiLoginCase):
     def test_ui_files_are_served_with_a_strict_policy(self):
         for path, content_type in (("/ui", "text/html"), ("/ui/app.js", "text/javascript"),
-                                   ("/ui/app.css", "text/css")):
+                                   ("/ui/app.css", "text/css"),
+                                   ("/ui/preview.css", "text/css")):
             with self.subTest(path=path):
                 response = self.client.get(path, follow_redirects=False)
                 self.assertEqual(response.status_code, 200)
                 self.assertTrue(response.headers["content-type"].startswith(content_type))
                 self.assertEqual(response.headers["content-security-policy"],
                                  "default-src 'none'; script-src 'self'; style-src 'self'; "
-                                 "connect-src 'self'; img-src 'self'; frame-src 'self'; "
+                                 "connect-src 'self'; img-src 'self' http: https:; media-src 'self'; "
                                  "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
                 self.assertEqual(response.headers["x-content-type-options"], "nosniff")
                 self.assertEqual(response.headers["referrer-policy"], "no-referrer")

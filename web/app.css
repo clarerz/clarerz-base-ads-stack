@@ -36,7 +36,6 @@ progress { width: 100%; margin-top: 10px; }
 .ad-list button { margin-top: 0; }
 #preview-dialog { width: min(1500px, 95vw); }
 #preview-frames { display: flex; flex-wrap: wrap; gap: 16px; }
-#preview-frames figure { margin: 0; }
+#preview-frames figure { margin: 0; overflow-x: auto; max-width: 100%; }
 #preview-frames figcaption { font-weight: 600; }
-#preview-frames iframe { max-width: 100%; border: 1px solid #dddfe2; background: #fff; }
 .warning { margin: 4px 0 0; color: #8a5a00; }

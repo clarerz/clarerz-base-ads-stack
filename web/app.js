@@ -46,7 +46,7 @@ function setStatus(message) {
   $("status").textContent = message;
 }
 
-function setBusy(form, busy) {
+function setFormBusy(form, busy) {
   form.querySelectorAll("button").forEach((button) => { button.disabled = busy; });
 }
 
@@ -93,7 +93,7 @@ $("sign-in-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   clearErrors(form);
-  setBusy(form, true);
+  setFormBusy(form, true);
   try {
     const data = await api("POST", "/session", { login: $("login").value, password: $("password").value });
     form.reset();
@@ -103,7 +103,7 @@ $("sign-in-form").addEventListener("submit", async (event) => {
     showError("signin", error,
       error.status === 401 ? "Wrong username, account ID, or password." : error.message);
   } finally {
-    setBusy(form, false);
+    setFormBusy(form, false);
   }
 });
 
@@ -114,7 +114,7 @@ $("sign-up-form").addEventListener("submit", async (event) => {
   const username = $("signup-username").value;
   const password = $("signup-password").value;
   clearErrors(form);
-  setBusy(form, true);
+  setFormBusy(form, true);
   try {
     const accountId = encodeURIComponent($("signup-account_id").value.trim());
     await api("POST", `/accounts/${accountId}/users`, { username, password },
@@ -126,7 +126,7 @@ $("sign-up-form").addEventListener("submit", async (event) => {
     showError("signup", error);
   } finally {
     token.value = "";  // The token is only needed for this one request.
-    setBusy(form, false);
+    setFormBusy(form, false);
   }
 });
 
@@ -213,11 +213,16 @@ function clearMedia() {
   }
 }
 
+// Fetch one item by its handle.
+function lookupMedia(kind, key) {
+  return kind === "image"
+    ? api("GET", `/accounts/${session.account_id}/images/lookup?image_hash=${encodeURIComponent(key)}`)
+    : api("GET", `/videos/${encodeURIComponent(key)}`);
+}
+
 // Fetch one item by its handle and select it in its list.
 async function selectMedia(kind, key) {
-  const item = kind === "image"
-    ? await api("GET", `/accounts/${session.account_id}/images/lookup?image_hash=${encodeURIComponent(key)}`)
-    : await api("GET", `/videos/${encodeURIComponent(key)}`);
+  const item = await lookupMedia(kind, key);
   const radio = addMedia(kind, item, true);
   radio.checked = true;
   radio.dispatchEvent(new Event("change", { bubbles: true }));
@@ -270,7 +275,7 @@ $("upload-form").addEventListener("submit", async (event) => {
   const progress = $("upload-progress");
   progress.value = 0;
   progress.hidden = false;
-  setBusy(form, true);
+  setFormBusy(form, true);
   try {
     const created = await sendFile(`/accounts/${session.account_id}/${MEDIA[kind].path}?${params}`,
       file, (fraction) => { progress.value = Math.round(fraction * 100); });
@@ -289,7 +294,7 @@ $("upload-form").addEventListener("submit", async (event) => {
     }
   } finally {
     progress.hidden = true;
-    setBusy(form, false);
+    setFormBusy(form, false);
   }
 });
 
@@ -357,7 +362,7 @@ $("ad-form").addEventListener("submit", async (event) => {
     showError("ad", {}, "Choose an image or video above, or enter an image link.");
     return;
   }
-  setBusy(form, true);
+  setFormBusy(form, true);
   try {
     const ad = await api("POST", `/accounts/${session.account_id}/ads`, body);
     $("ad-text").value = "";
@@ -366,7 +371,7 @@ $("ad-form").addEventListener("submit", async (event) => {
   } catch (error) {
     if (!sessionEnded(error)) showError("ad", error);
   } finally {
-    setBusy(form, false);
+    setFormBusy(form, false);
   }
 });
 
@@ -387,15 +392,12 @@ function adMedia(ad) {
   return `Image ${(image && image.image_name) || `${ad.image_hash.slice(0, 8)}…`}`;
 }
 
-function addAd(ad, atTop = false) {
-  if ($(`ad-${ad.id}`)) return;
+function adCells(ad) {
   const cell = (tag, text) => {
     const element = document.createElement(tag);
     element.textContent = text;
     return element;
   };
-  const row = document.createElement("li");
-  row.id = `ad-${ad.id}`;
   const link = cell("a", `#${ad.id}`);
   link.href = `/ads/${ad.id}`;
   const created = new Date(ad.creation_time * 1000);
@@ -409,9 +411,22 @@ function addAd(ad, atTop = false) {
   preview.type = "button";
   preview.setAttribute("aria-label", `Preview ad #${ad.id}`);
   preview.addEventListener("click", () => openPreview(ad.id));
-  row.append(link, time, cell("span", adMedia(ad)), text, preview);
+  return [link, time, cell("span", adMedia(ad)), text, preview];
+}
+
+function addAd(ad, atTop = false) {
+  if ($(`ad-${ad.id}`)) return;
+  const row = document.createElement("li");
+  row.id = `ad-${ad.id}`;
+  row.append(...adCells(ad));
   $("ad-list")[atTop ? "prepend" : "append"](row);
   $("ad-empty").hidden = true;
+}
+
+function updateAdRow(ad) {
+  const row = $(`ad-${ad.id}`);
+  // The Preview button stays, so closing the dialog can return focus to it.
+  if (row) row.replaceChildren(...adCells(ad).slice(0, -1), row.lastElementChild);
 }
 
 async function loadAds(more = false) {
@@ -446,9 +461,327 @@ onSignedOut.push(clearAds);
 
 const WARNINGS = { text_truncated: "Text is cut off", media_cropped: "Image is cropped to fit" };
 let previewRequest = 0;  // A response is dropped when a newer openPreview has started.
+// The open dialog's ad (GET /ads/{id}) and previews listing; null while closed.
+let editor = null;
+
+function node(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function mediaUnavailable(path) {
+  const box = node("div", "media empty", "Media unavailable");
+  box.setAttribute("role", "img");
+  box.setAttribute("aria-label", "Media unavailable");
+  if (path) box.dataset.path = path;  // A failed URL stays failed until the media changes.
+  return box;
+}
+
+// Signed URLs expire, so a load failure first re-fetches the listing, once per opening.
+async function mediaFailed(event) {
+  const element = event.currentTarget;
+  if (!element.isConnected) return;  // Left over from a closed or re-rendered dialog.
+  // No re-render while an edit is open or running: it would drop the user's text box.
+  if (editor.retried || editor.busy) {
+    element.replaceWith(mediaUnavailable(element.dataset.path));
+    return;
+  }
+  editor.retried = true;
+  const { adId, request } = editor;
+  try {
+    const page = await api("GET", `/accounts/${session.account_id}/ads/${adId}/previews`);
+    if (request !== previewRequest) return;
+    editor.page = page;
+  } catch (error) {
+    if (request !== previewRequest) return;
+    if (sessionEnded(error)) {
+      closePreview();
+      return;
+    }
+  }
+  if (editor.busy) {  // An edit opened meanwhile; the next render uses the fresh listing.
+    element.replaceWith(mediaUnavailable(element.dataset.path));
+    return;
+  }
+  // Fresh elements, even if the path is unchanged.
+  $("preview-frames").querySelectorAll(".media").forEach((media) => media.remove());
+  renderPlacements();
+}
+
+function mediaElement(format) {
+  const { kind, url } = editor.page.media;
+  const path = url && url.split("?")[0];
+  const current = $("preview-frames").querySelector(`figure[data-format="${format}"] .media`);
+  // Keeping the element means a re-render neither reloads nor restarts the media.
+  if (path && current && current.dataset.path === path) return current;
+  if (!path) return mediaUnavailable();
+  let media;
+  if (kind === "image") {
+    media = node("img", "media");
+    media.alt = "Ad image";
+  } else {
+    // The same playback attributes as preview pages (previews._media).
+    media = node("video", "media");
+    const playback = format === "story" ? ["controls", "autoplay", "muted", "loop", "playsinline"]
+      : ["controls", "muted", "playsinline"];
+    playback.forEach((name) => media.setAttribute(name, ""));
+    media.muted = true;  // The attribute alone does not mute an element created by script.
+    media.preload = "metadata";
+    media.setAttribute("aria-label", "Ad video");
+  }
+  media.dataset.path = path;
+  media.addEventListener("error", mediaFailed);
+  media.src = url;
+  return media;
+}
+
+// ---- Inline editing ----
+
+// Ad ID → its running edit. Opening that ad's preview waits for it, so the dialog shows the
+// saved result and the next edit starts from it.
+const pendingEdits = new Map();
+function trackEdit(adId, edit) {
+  pendingEdits.set(adId, edit);
+  edit.finally(() => { if (pendingEdits.get(adId) === edit) pendingEdits.delete(adId); });
+  return edit;
+}
+
+const editHint = node("span", "", "Edit ad text");
+editHint.id = "edit-text-hint";
+editHint.hidden = true;
+$("preview-dialog").append(editHint);
+
+// One edit at a time: while one is open or running, the other edit targets are inert.
+// `except`, if given, is the element being edited; a failed save shows its error below that
+// element's placement, or in the dialog's message line without one.
+function setBusy(active, except) {
+  editor.busy = active && (except || true);
+  $("preview-frames").querySelectorAll(".text-body[role=button], .replace")
+    .forEach((target) => { target.inert = active && target !== except; });
+}
+
+// Below the placement of the element being edited, else in the dialog's message line.
+function showEditError(message) {
+  const figure = editor.busy instanceof Element && editor.busy.closest("figure");
+  if (!figure) {
+    $("preview-message").textContent = message;
+    return;
+  }
+  const id = `${figure.dataset.format}-edit-error`;
+  let error = $(id);
+  if (!error) {
+    error = node("p", "error");
+    error.id = id;
+    error.setAttribute("role", "alert");
+    figure.append(error);
+  }
+  error.textContent = message;
+  editor.busy.setAttribute("aria-describedby", id);  // Links the error to its control.
+}
+
+// Saves one edit. The ad's row always shows the result; the dialog only if it is the same
+// opening, so a late response never touches another ad's placements. An edit that awaited
+// something first passes the opening it started in.
+async function runEdit(adId, body, describe, opening = editor) {
+  const open = () => editor !== null && editor === opening;
+  let ad;
+  try {
+    ad = await api("PATCH", `/accounts/${session.account_id}/ads/${adId}`, body);
+  } catch (error) {
+    if (sessionEnded(error)) return null;
+    if (open()) showEditError(HINTS[error.field] || error.message);
+    else setStatus(`Ad #${adId}: ${describe} not saved: ${error.message}`);
+    return null;
+  }
+  updateAdRow(ad);
+  if (!open()) return ad;
+  editor.ad = ad;
+  try {
+    const page = await api("GET", `/accounts/${session.account_id}/ads/${adId}/previews`);
+    if (open()) {
+      editor.page = page;
+      $("preview-message").textContent = "";  // Drops an error left by an earlier save.
+    }
+  } catch (error) {
+    if (sessionEnded(error) || !open()) return ad;
+    editor.page.data.forEach((entry) => { entry.text = ad.text; });  // Warnings stay stale.
+    $("preview-message").textContent = error.message;
+  }
+  if (open()) renderPlacements();
+  return ad;
+}
+
+function textTarget(text) {
+  const target = node("span", "text-body", text);  // Its accessible name is the text.
+  target.setAttribute("role", "button");
+  target.tabIndex = 0;
+  target.setAttribute("aria-describedby", editHint.id);
+  target.addEventListener("click", openTextBox);
+  target.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();  // Space would scroll, and neither key should reach the box.
+    openTextBox(event);
+  });
+  return target;
+}
+
+function openTextBox(event) {
+  const block = event.currentTarget.parentElement;
+  const box = node("textarea");
+  box.value = editor.ad.text;
+  box.setAttribute("aria-labelledby", editHint.id);
+  block.replaceChildren(box);  // "See more" goes too while editing.
+  setBusy(true, box);
+  box.focus();
+  box.addEventListener("keydown", (keyEvent) => {
+    if (keyEvent.key !== "Escape") return;
+    keyEvent.preventDefault();  // Never closes the dialog.
+    if (!box.readOnly) closeTextBox();
+  });
+  box.addEventListener("blur", () => saveText(box));
+}
+
+// A re-render restores the saved text and drops the box and any error.
+function closeTextBox() {
+  setBusy(false);
+  renderPlacements();
+}
+
+async function saveText(box) {
+  // A box that is closing or saving ignores blur; so does one whose window lost focus.
+  if (!editor || editor.busy !== box || box.readOnly || !document.hasFocus()) return;
+  if (box.value === editor.ad.text.replace(/\r\n?/g, "\n")) {  // A textarea's line breaks are \n.
+    closeTextBox();
+    return;
+  }
+  const opening = editor;
+  box.readOnly = true;
+  const ad = await trackEdit(editor.adId, runEdit(editor.adId, { text: box.value }, "text"));
+  if (editor !== opening) return;
+  if (ad) {
+    setBusy(false);
+    return;
+  }
+  box.readOnly = false;
+  box.setAttribute("aria-invalid", "true");
+}
+
+// Uploads a file picked in a placement and makes it the ad's media. Runs while the placement's
+// replace button is the busy element; errors show below its placement.
+async function replaceMedia(adId, kind, file) {
+  const opening = editor;
+  const fail = (message) => {
+    if (editor === opening) showEditError(message);
+    else setStatus(`Ad #${adId}: media not saved: ${message}`);
+    return null;
+  };
+  // The picker's filter can be overridden.
+  if (kindOf(file.name) !== kind) {
+    return fail(`Choose ${kind === "image" ? "an image" : "a video"} file.`);
+  }
+  const params = new URLSearchParams({ filename: file.name });
+  if (kind === "video") params.set("name", file.name.slice(0, file.name.lastIndexOf(".")) || file.name);
+  const progress = node("progress", "upload");
+  progress.max = 100;
+  progress.value = 0;
+  progress.setAttribute("aria-label", "Upload progress");
+  editor.busy.closest("article").append(progress);
+  try {
+    let created;
+    try {
+      created = await sendFile(`/accounts/${session.account_id}/${MEDIA[kind].path}?${params}`,
+        file, (fraction) => { progress.value = Math.round(fraction * 100); });
+    } catch (error) {
+      if (error.status !== 409) throw error;
+      created = error.body;  // The account already has these bytes; this names the existing item.
+    }
+    const key = MEDIA[kind].key(created);
+    addMedia(kind, await lookupMedia(kind, key), true);
+    const body = kind === "image" ? { image_hash: key } : { video_id: Number(key) };
+    return await runEdit(adId, body, "media", opening);
+  } catch (error) {
+    return sessionEnded(error) ? null : fail(HINTS[error.field] || error.message);
+  } finally {
+    progress.remove();
+  }
+}
+
+// An image's replace button is a transparent overlay on the whole frame, beside the image so
+// the image keeps its name. A video keeps its own clicks for playback, so its button sits
+// apart. Returns what goes where the media goes, and what goes at the end of the article.
+function replaceControls(kind, media) {
+  const label = kind === "image" ? "Replace image" : "Replace video";
+  const button = node("button", `replace ${kind}`);
+  button.type = "button";
+  button.setAttribute("aria-label", label);
+  const input = node("input");
+  input.type = "file";
+  input.accept = (kind === "image" ? IMAGE_EXTENSIONS : VIDEO_EXTENSIONS).join(",");
+  input.hidden = true;
+  button.addEventListener("click", () => { if (!editor.busy) input.click(); });
+  input.addEventListener("change", async () => {
+    const file = input.files[0];
+    input.value = "";
+    if (!file || editor.busy) return;
+    const opening = editor;
+    setBusy(true, button);
+    await trackEdit(opening.adId, replaceMedia(opening.adId, kind, file));
+    if (editor === opening) setBusy(false);
+  });
+  if (kind === "video") {
+    button.textContent = label;
+    return [[media], [button, input]];
+  }
+  button.append(node("span", "cue", label));
+  return [[media, button], [input]];
+}
+
+// The DOM order of previews.render, so placements match the preview pages.
+function placement(entry) {
+  const figure = node("figure");
+  figure.dataset.format = entry.format;
+  const name = entry.format.charAt(0).toUpperCase() + entry.format.slice(1);
+  const caption = node("figcaption", "", name);
+  const article = node("article", `ad ${entry.format}`);
+  const header = node("header");
+  header.append(node("strong", "", session.account_name), " · Sponsored");
+  const text = node("p", "text");
+  text.append(textTarget(entry.text));
+  const [frame, controls] = replaceControls(editor.page.media.kind, mediaElement(entry.format));
+  if (entry.format === "feed") {
+    if (entry.warnings.includes("text_truncated")) {
+      text.append(" ", node("span", "more", "See more"));
+    }
+    article.append(header, text, ...frame);
+  } else if (entry.format === "story") {
+    article.append(...frame, header, text);
+  } else {
+    article.append(...frame, text);
+  }
+  article.append(...controls);  // Last, so the video's button sits above story's header.
+  figure.append(caption, article,
+    ...entry.warnings.map((warning) => node("p", "warning", WARNINGS[warning] || warning)));
+  return figure;
+}
+
+function renderPlacements() {
+  const frames = $("preview-frames");
+  const focused = document.activeElement;
+  const figure = frames.contains(focused) && focused.closest("figure");
+  frames.replaceChildren(...editor.page.data.map(placement));
+  // Replacing the placements drops focus; it goes to the same control in the same placement.
+  if (!figure || document.activeElement === focused) return;
+  const control = [".replace", ".media"].find((selector) => focused.matches(selector)) || ".text-body";
+  frames.querySelector(`figure[data-format="${figure.dataset.format}"] ${control}`).focus();
+}
 
 function closePreview() {
+  const box = $("preview-frames").querySelector("textarea");
+  if (box) box.blur();  // Changed text saves, as on any blur.
   previewRequest += 1;
+  editor = null;
   // Nothing from the dialog stays in the DOM once it is closed or the session ends.
   $("preview-frames").replaceChildren();
   $("preview-share").hidden = true;
@@ -458,6 +791,7 @@ function closePreview() {
 
 async function openPreview(adId) {
   const request = ++previewRequest;
+  editor = { adId, ad: null, page: null, request, retried: false, busy: false };
   const dialog = $("preview-dialog");
   $("preview-heading").textContent = `Preview of ad #${adId}`;
   $("preview-frames").replaceChildren();
@@ -468,33 +802,15 @@ async function openPreview(adId) {
   $("preview-message").textContent = "Loading preview…";
   if (!dialog.open) dialog.showModal();
   try {
-    const page = await api("GET", `/accounts/${session.account_id}/ads/${adId}/previews`);
+    await pendingEdits.get(adId);
+    const [ad, page] = await Promise.all([
+      api("GET", `/ads/${adId}`),
+      api("GET", `/accounts/${session.account_id}/ads/${adId}/previews`),
+    ]);
     if (request !== previewRequest) return;
     $("preview-message").textContent = "";
-    if (page.data.some((item) => item.preview_url === null)) {
-      $("preview-message").textContent = "Previews are unavailable on this server.";
-      return;
-    }
-    $("preview-frames").replaceChildren(...page.data.map((item) => {
-      const figure = document.createElement("figure");
-      figure.dataset.format = item.format;
-      const name = item.format.charAt(0).toUpperCase() + item.format.slice(1);
-      const caption = document.createElement("figcaption");
-      caption.textContent = name;
-      const frame = document.createElement("iframe");
-      frame.src = item.preview_url;
-      frame.width = item.width;
-      frame.height = item.height;
-      frame.title = `${name} preview of ad #${adId}`;
-      figure.append(caption, frame);
-      for (const warning of item.warnings) {
-        const note = document.createElement("p");
-        note.className = "warning";
-        note.textContent = WARNINGS[warning] || warning;
-        figure.append(note);
-      }
-      return figure;
-    }));
+    Object.assign(editor, { ad, page });
+    renderPlacements();
     if (page.share_url) {
       $("share-link").value = page.share_url;
       $("share-expires").textContent = `Expires ${new Date(page.share_expires * 1000).toLocaleString()}`;
