@@ -6,7 +6,6 @@ and the benchmark worker. Persistence is also checked in a fresh Python process.
 
 from contextlib import closing
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,29 +18,9 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
+from helpers import BASE_DIR, VALID_TEXT, error_body, load_isolated_modules
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-VALID_TEXT = "Summer sale! Get 50% off today only - limited time offer"
 NEW_URL = "https://cdn.example.com/ads/generated_zzz_9187.png"
-MODULE_NAMES = ("config", "models", "repository", "validation", "file_store", "image_store",
-                "video_store", "publishing", "service", "publish")
-
-
-def load_isolated_modules(test_case, data_dir, names=MODULE_NAMES):
-    """Load fresh copies of the modules on test_case, storing data in data_dir."""
-    env = patch.dict(os.environ, {"ADS_STACK_DATA_DIR": str(data_dir)})
-    env.start()
-    test_case.addCleanup(env.stop)
-    modules = patch.dict(sys.modules)
-    modules.start()
-    test_case.addCleanup(modules.stop)
-    # Load fresh modules after setting storage, without creating project data.
-    for name in names:
-        spec = importlib.util.spec_from_file_location(name, BASE_DIR / f"{name}.py")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        setattr(test_case, name, module)
 
 
 class AdsStackTests(unittest.TestCase):
@@ -71,13 +50,7 @@ class AdsStackTests(unittest.TestCase):
         return response["id"]
 
     def assert_error(self, response, code, field):
-        self.assertIsInstance(response, dict)
-        self.assertEqual(set(response), {"error_code", "error_message"})
-        self.assertEqual(response["error_code"], code)
-        message = {"001": f"{field} is an invalid field on this endpoint",
-                   "003": f"Storage failed while handling {field}"}.get(
-                       code, f"The value provided for {field} is invalid")
-        self.assertEqual(response["error_message"], message)
+        self.assertEqual(response, error_body(code, field))
 
     def fresh_process(self, code):
         env = dict(os.environ, PYTHONPATH=str(BASE_DIR), PYTHONDONTWRITEBYTECODE="1")
@@ -560,6 +533,17 @@ class AdsStackTests(unittest.TestCase):
             self.svc.update_ad(self.ad.id, {**self.auth, "text": "x", "image": NEW_URL + "?2"})
         self.assertEqual(self.owner_rows(), rows)
 
+    def test_concurrent_updates_keep_each_field(self):
+        self.setup_update()
+        publisher, validate = self.svc.publisher, self.svc.publisher.validator.validate_update
+        # Both edits read the ad before either writes; each writes only the field it sent.
+        text_edit = validate(self.ad.id, {**self.auth, "text": "New copy"})
+        image_edit = validate(self.ad.id, {**self.auth, "image": NEW_URL})
+        publisher.persist(text_edit)
+        ad = publisher.persist(publisher.normalize_image(image_edit))
+        self.assertEqual(ad.text, "New copy")
+        self.assertNotEqual(ad.image_hash, self.ad.image_hash)
+
     def test_update_runs_rules_on_merged_draft(self):
         self.setup_update()
         seen = []
@@ -577,7 +561,8 @@ class AdsStackTests(unittest.TestCase):
                                                   image_storage=storage, clock=lambda: self.now))
         svc.update_ad(self.ad.id, {**self.auth, "text": "Allowed copy"})
         self.assertEqual(seen[-1], self.models.AdDraft(1, "Allowed copy", None, self.ad.image_hash,
-                                                       None, None, ad_id=self.ad.id))
+                                                       None, None, ad_id=self.ad.id,
+                                                       changed=frozenset({"text"})))
         # A rejected link edit stores nothing and ingests nothing.
         stored, rows = self.repo.get_ad(self.ad.id), self.owner_rows()
         with self.assertRaises(self.validation.ValidationError):

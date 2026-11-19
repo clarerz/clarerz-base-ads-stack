@@ -8,7 +8,6 @@ import os
 import re
 from pathlib import Path
 import sqlite3
-import struct
 import tempfile
 import time
 from types import SimpleNamespace
@@ -21,12 +20,10 @@ try:
 except ImportError:
     raise unittest.SkipTest("fastapi is not installed; see requirements.txt")
 
-from test_ads_stack import BASE_DIR, MODULE_NAMES, VALID_TEXT, load_isolated_modules
+from helpers import BASE_DIR, MODULE_NAMES, PNG, VALID_TEXT, error_body, load_isolated_modules
 
 ADMIN_KEY = "test-admin"
 MEDIA_KEY = "test-media"
-# A PNG header declaring 2x3 pixels: enough for the size and the sniffed type.
-PNG = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 2, 3) + b"\x08\x02\x00\x00\x00"
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16
 
 
@@ -63,10 +60,7 @@ class ApiTests(unittest.TestCase):
 
     def assert_error(self, response, status, code, field):
         self.assertEqual(response.status_code, status, response.text)
-        message = {"001": f"{field} is an invalid field on this endpoint",
-                   "003": f"Storage failed while handling {field}"}.get(
-                       code, f"The value provided for {field} is invalid")
-        self.assertEqual(response.json(), {"error_code": code, "error_message": message})
+        self.assertEqual(response.json(), error_body(code, field))
 
     def test_create_account_requires_admin_key(self):
         body = {"id": 7, "name": "Shop"}
@@ -758,6 +752,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.upload_video(MP4).status_code, 201)
         self.assertEqual(self.publish_ad(video_id=1, text="Watch now").status_code, 201)
         warnings = [entry["warnings"] for entry in self.previews(3).json()["data"]]
+        self.assertEqual(warnings, [[], [], []])
+        # A link image from before sizes were recorded lists a placeholder size, but its real
+        # size is unknown, so nothing is reported as cropped either.
+        self.now = self.service.DIMENSIONS_CUTOFF - 100
+        self.assertEqual(self.publish_ad(image="https://cdn.example.com/tall.jpg",
+                                         text="Hello").status_code, 201)
+        warnings = [entry["warnings"] for entry in self.previews(4).json()["data"]]
         self.assertEqual(warnings, [[], [], []])
 
     def test_listing_reports_text_and_media(self):

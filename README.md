@@ -609,12 +609,13 @@ ad's previews with the token, open each page by its signed URL, check its header
 across server processes and after a token reissued elsewhere. `tests/test_api.py` checks
 share links: their 7-day lifetime, revocation, and the identical 404 page.
 
-The tests use temporary storage and include fresh-process persistence checks.
+The tests use temporary storage (in `/dev/shm` when it is writable and `TMPDIR` is unset)
+and include fresh-process persistence checks.
 They are adapted from the original task's behavior tests for the canonical API;
 benchmark isolation, API discovery, and reward reporting are omitted.
 Additional checks cover the object API, custom rules, custom publishing stages,
 injected image storage and clocks, and compatibility with existing SQLite data.
-The standard-library suite has 135 tests (212 with the HTTP API suites, 240 with the
+The standard-library suite has 148 tests (237 with the HTTP API suites, 303 with the
 browser tests), including boundary cases, storage failures, rollback,
 schema migrations, concurrent SQLite ad ID allocation and registry writes, token
 and ownership enforcement, size limits, and ad, video, and image listings. See

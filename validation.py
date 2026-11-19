@@ -230,7 +230,10 @@ class AdValidator:
         draft = AdDraft(
             creator_id, text, image, image_hash,
             self.validate_video(data["video_id"], creator_id) if "video_id" in data
-            else ad.video_id, ad_id=ad.id)
+            else ad.video_id, ad_id=ad.id,
+            # Only sent fields are written, so concurrent edits of other fields survive.
+            changed=frozenset({"text", "video_id"}.intersection(data)
+                              | ({"image_hash"} if image_fields else set())))
         for rule in self.rules:
             rule(draft)
         return draft

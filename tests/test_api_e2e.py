@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import re
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -28,12 +27,10 @@ try:
 except ImportError:
     raise unittest.SkipTest("fastapi and uvicorn are not installed; see requirements.txt")
 
-from test_ads_stack import BASE_DIR, VALID_TEXT, load_isolated_modules
+from helpers import BASE_DIR, PNG, VALID_TEXT, load_isolated_modules, request
 
 ADMIN_KEY = "e2e-admin"
 MEDIA_KEY = "e2e-media"
-# A PNG header declaring 2x3 pixels: enough for the size and the sniffed type.
-PNG = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 2, 3) + b"\x08\x02\x00\x00\x00"
 MP4 = b"\x00\x00\x00\x18ftypmp42" + bytes(range(64))
 SEEDED_URL = jsonlib.loads((BASE_DIR / "images.json").read_text())[0]["url"]
 ROUTES = {"/accounts", "/accounts/{account_id}", "/accounts/{account_id}/ads",
@@ -44,24 +41,6 @@ ROUTES = {"/accounts", "/accounts/{account_id}", "/accounts/{account_id}/ads",
           "/accounts/{account_id}/ads/{ad_id}/previews/{ad_format}",
           "/accounts/{account_id}/ads/{ad_id}/share",
           "/accounts/{account_id}/users", "/session"}
-
-
-def request(method, url, *, json=None, data=None, token=None):
-    """Return (status, parsed JSON body); HTTP errors are returned, not raised."""
-    headers = {}
-    if json is not None:
-        # urllib would otherwise send form encoding, which is not a JSON body.
-        data = jsonlib.dumps(json).encode()
-        headers["Content-Type"] = "application/json"
-    if token is not None:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return response.status, jsonlib.loads(response.read() or b"null")
-    except urllib.error.HTTPError as exc:
-        with exc:
-            return exc.code, jsonlib.loads(exc.read() or b"null")
 
 
 def fetch(url, token=None):
@@ -92,49 +71,58 @@ def media_sources(page):
     return [html.unescape(src) for src in re.findall(r'src="([^"]*)"', page)]
 
 
+def stop_server(process):
+    process.terminate()
+    process.wait(timeout=5)
+
+
+def launch_server(data_dir, add_cleanup, admin_key=ADMIN_KEY, media_key=None):
+    """Start uvicorn on a free port and return (process, base URL) once it answers.
+
+    add_cleanup registers the server's teardown, e.g. a test's or a class's addCleanup.
+    """
+    # ponytail: small race between closing this socket and uvicorn binding it; retry if
+    # CI flakes.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    env = dict(os.environ, ADS_STACK_DATA_DIR=str(data_dir), PYTHONDONTWRITEBYTECODE="1")
+    env.pop("ADS_ADMIN_KEY", None)
+    env.pop("ADS_MEDIA_KEY", None)
+    if admin_key is not None:
+        env["ADS_ADMIN_KEY"] = admin_key
+    if media_key is not None:
+        env["ADS_MEDIA_KEY"] = media_key
+    stderr = tempfile.TemporaryFile()
+    add_cleanup(stderr.close)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "api:app", "--host", "127.0.0.1",
+         "--port", str(port), "--no-access-log"],
+        cwd=BASE_DIR, env=env, stdout=subprocess.DEVNULL, stderr=stderr)
+    add_cleanup(stop_server, process)
+    url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            urllib.request.urlopen(f"{url}/openapi.json", timeout=1).close()
+            return process, url
+        except OSError:
+            if process.poll() is not None or time.monotonic() > deadline:
+                stderr.seek(0)
+                raise AssertionError(f"server did not start:\n{stderr.read().decode()}")
+            time.sleep(0.05)
+
+
 class ApiEndToEndTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="ads-api-e2e-")
         self.addCleanup(temporary.cleanup)
         self.data_dir = Path(temporary.name)
 
-    def start_server(self, data_dir, admin_key=ADMIN_KEY, media_key=None):
-        """Start uvicorn on a free port and return (process, base URL) once it answers."""
-        # ponytail: small race between closing this socket and uvicorn binding it; retry if
-        # CI flakes.
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        env = dict(os.environ, ADS_STACK_DATA_DIR=str(data_dir), PYTHONDONTWRITEBYTECODE="1")
-        env.pop("ADS_ADMIN_KEY", None)
-        env.pop("ADS_MEDIA_KEY", None)
-        if admin_key is not None:
-            env["ADS_ADMIN_KEY"] = admin_key
-        if media_key is not None:
-            env["ADS_MEDIA_KEY"] = media_key
-        stderr = tempfile.TemporaryFile()
-        self.addCleanup(stderr.close)
-        process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "api:app", "--host", "127.0.0.1",
-             "--port", str(port), "--no-access-log"],
-            cwd=BASE_DIR, env=env, stdout=subprocess.DEVNULL, stderr=stderr)
-        self.addCleanup(self.stop_server, process)
-        url = f"http://127.0.0.1:{port}"
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                urllib.request.urlopen(f"{url}/openapi.json", timeout=1).close()
-                return process, url
-            except OSError:
-                if process.poll() is not None or time.monotonic() > deadline:
-                    stderr.seek(0)
-                    self.fail(f"server did not start:\n{stderr.read().decode()}")
-                time.sleep(0.05)
+    def start_server(self, data_dir, **options):
+        return launch_server(data_dir, self.addCleanup, **options)
 
-    @staticmethod
-    def stop_server(process):
-        process.terminate()
-        process.wait(timeout=5)
+    stop_server = staticmethod(stop_server)
 
     def create_account(self, url, account_id=1):
         status, body = request("POST", f"{url}/accounts", json={"id": account_id, "name": "A"},

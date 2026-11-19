@@ -6,11 +6,11 @@ import json as jsonlib
 import re
 from contextlib import closing
 from pathlib import Path
+import shutil
 import sqlite3
 import struct
 import tempfile
 import unittest
-import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
@@ -22,6 +22,7 @@ try:
 except ImportError:
     raise unittest.SkipTest("playwright is not installed; see requirements-dev.txt")
 
+from helpers import request
 # Imported as a module so its test class is not collected a second time from this file.
 import test_api_e2e
 
@@ -52,27 +53,12 @@ RECORD_WEBM = """async () => {
 
 def call(method, url, json=None, token=None):
     """Return (status, parsed JSON body) for a UI-style request; HTTP errors are returned."""
-    headers = {"X-Ads-UI": "1"}
-    data = None
-    if json is not None:
-        data = jsonlib.dumps(json).encode()
-        headers["Content-Type"] = "application/json"
-    if token is not None:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return response.status, jsonlib.loads(response.read() or b"null")
-    except urllib.error.HTTPError as exc:
-        with exc:
-            return exc.code, jsonlib.loads(exc.read() or b"null")
+    return request(method, url, json=json, token=token, headers={"X-Ads-UI": "1"})
 
 
 class UiCase(unittest.TestCase):
-    """A fresh server and data directory per test, one Chromium per class; defines no tests."""
+    """One server and Chromium per class, data emptied before each test; defines no tests."""
 
-    start_server = test_api_e2e.ApiEndToEndTests.start_server
-    stop_server = staticmethod(test_api_e2e.ApiEndToEndTests.stop_server)
     media_key = None  # Previews need a media key; subclasses that preview set one.
     context_options = {}  # Extra browser-context options, e.g. permissions.
     _webm = None
@@ -86,6 +72,11 @@ class UiCase(unittest.TestCase):
             cls.playwright.stop()
             raise unittest.SkipTest(f"Chromium is not installed (playwright install chromium): "
                                     f"{exc}")
+        cls.data_dir = Path(tempfile.mkdtemp(prefix="ads-ui-browser-"))
+        cls.addClassCleanup(shutil.rmtree, cls.data_dir)
+        # The default (Secure) cookie: browsers accept it from http://127.0.0.1.
+        cls.server, cls.url = test_api_e2e.launch_server(cls.data_dir, cls.addClassCleanup,
+                                                         media_key=cls.media_key)
 
     @classmethod
     def tearDownClass(cls):
@@ -93,11 +84,8 @@ class UiCase(unittest.TestCase):
         cls.playwright.stop()
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="ads-ui-browser-")
-        self.addCleanup(temporary.cleanup)
-        self.data_dir = Path(temporary.name)
-        # The default (Secure) cookie: browsers accept it from http://127.0.0.1.
-        _, self.url = self.start_server(self.data_dir, media_key=self.media_key)
+        self.assertIsNone(self.server.poll(), "the class's server exited")
+        self.empty_data()
         self.token = self.create_account(42, "Acme Inc")
         context = self.browser.new_context(**self.context_options)
         self.addCleanup(context.close)
@@ -111,6 +99,23 @@ class UiCase(unittest.TestCase):
                      and not message.text.startswith("Failed to load resource")
                      and self.page_errors.append(message.text))
         self.addCleanup(lambda: self.assertEqual(self.page_errors, []))
+
+    def empty_data(self):
+        """Return the server to a fresh start: no rows (IDs restart at 1) and no stored files."""
+        with closing(sqlite3.connect(self.data_dir / "ads.db")) as conn, conn:
+            tables = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            for (table,) in tables:
+                conn.execute(f'DELETE FROM "{table}"')
+        # Directories stay: the server makes some only at startup.
+        for path in self.data_dir.iterdir():
+            if path.is_dir():
+                for child in path.iterdir():
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+            elif not path.name.startswith("ads.db") and path.name != "image_registry.lock":
+                path.unlink()
 
     @classmethod
     def webm(cls):

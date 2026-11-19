@@ -236,13 +236,18 @@ class SQLiteAdsRepository:
             return self._select_ad(conn, ad_id)
 
     def update_ad(self, draft, update_time):
-        """Replace the ad's content; return it, or None if the creator has no such ad."""
+        """Write the draft's changed fields; return the ad, or None if the creator has none."""
+        columns = {"text": ("text_content", draft.text),
+                   "image_hash": ("image_hash", draft.image_hash),
+                   "video_id": ("video_id", draft.video_id)}
+        sets = [pair for field, pair in columns.items()
+                if draft.changed is None or field in draft.changed]
+        sets.append(("update_time", update_time))
         with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
-                "UPDATE ads SET text_content = ?, image_hash = ?, video_id = ?, update_time = ? "
+                f"UPDATE ads SET {', '.join(column + ' = ?' for column, _ in sets)} "
                 "WHERE id = ? AND creator_id = ?",
-                (draft.text, draft.image_hash, draft.video_id, update_time, draft.ad_id,
-                 draft.creator_id),
+                (*(value for _, value in sets), draft.ad_id, draft.creator_id),
             )
             return self._select_ad(conn, draft.ad_id) if cursor.rowcount == 1 else None
 

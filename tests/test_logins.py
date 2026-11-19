@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from test_ads_stack import load_isolated_modules
+from helpers import load_isolated_modules
 
 
 class LoginRepositoryTests(unittest.TestCase):

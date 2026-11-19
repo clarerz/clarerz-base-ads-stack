@@ -13,13 +13,11 @@ try:
 except ImportError:
     raise unittest.SkipTest("fastapi is not installed; see requirements.txt")
 
-from test_ads_stack import MODULE_NAMES, load_isolated_modules
+from helpers import MODULE_NAMES, PNG, error_body, load_isolated_modules
 
 ADMIN_KEY = "test-admin"
 PASSWORD = "correct horse"
 UI = {"X-Ads-UI": "1"}
-PNG = (b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR" + (2).to_bytes(4, "big")
-       + (3).to_bytes(4, "big") + b"\x08\x02\x00\x00\x00")
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16
 LOGIN_ERROR = {"error_code": "002", "error_message": "The value provided for login is invalid"}
 
@@ -66,10 +64,7 @@ class ApiLoginCase(unittest.TestCase):
 
     def assert_error(self, response, status, code, field):
         self.assertEqual(response.status_code, status, response.text)
-        message = {"001": f"{field} is an invalid field on this endpoint",
-                   "003": f"Storage failed while handling {field}"}.get(
-                       code, f"The value provided for {field} is invalid")
-        self.assertEqual(response.json(), {"error_code": code, "error_message": message})
+        self.assertEqual(response.json(), error_body(code, field))
 
 
 class SignUpRouteTests(ApiLoginCase):

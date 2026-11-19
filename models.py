@@ -26,6 +26,8 @@ class AdDraft:
     creation_time: Optional[int] = None
     # Set when editing an existing ad.
     ad_id: Optional[int] = None
+    # Fields an edit sent ("text", "image_hash", "video_id"); None writes them all.
+    changed: Optional[frozenset] = None
 
 
 @dataclass(frozen=True)

@@ -531,11 +531,17 @@ def _ad_image(service, ad):
 
 
 def _ad_size(service, ad):
-    """Return the (width, height) of the ad's image, or (None, None) for a video ad."""
+    """Return the recorded (width, height) of the ad's image, else (None, None)."""
     if ad.image_hash is None:
         return None, None
-    image = _ad_image(service, ad)[0]
-    return image.width, image.height
+    # Not describe_image: its placeholder size for older images would report false crops.
+    try:
+        entry = service.image_storage.get_image_by_hash(ad.image_hash)
+    except Exception as exc:
+        raise StorageError("image") from exc
+    entry = entry if isinstance(entry, dict) else {}
+    size = (entry.get("width"), entry.get("height"))
+    return size if all(type(side) is int and side > 0 for side in size) else (None, None)
 
 
 def _stored_media_src(request, access, kind, owner_id, media_hash):
